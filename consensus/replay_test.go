@@ -438,7 +438,7 @@ func setupChainWithChangingValidators(t *testing.T, name string, nBlocks int) (*
 		nVals,
 		nPeers,
 		name,
-		newMockTickerFunc(true),
+		newHeightOnlyTicker,
 		func(_ string) abci.Application {
 			return newKVStore()
 		})

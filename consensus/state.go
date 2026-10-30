@@ -13,8 +13,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cometbft/cometbft/privval"
-
 	proptypes "github.com/cometbft/cometbft/consensus/propagation/types"
 
 	"github.com/cometbft/cometbft/consensus/propagation"
@@ -146,10 +144,9 @@ type State struct {
 	nSteps int
 
 	// some functions can be overwritten for testing
-	decideProposal        func(height int64, round int32)
-	doPrevote             func(height int64, round int32)
-	setProposal           func(proposal *types.Proposal) error
-	StartedPrecommitSleep atomic.Bool
+	decideProposal func(height int64, round int32)
+	doPrevote      func(height int64, round int32)
+	setProposal    func(proposal *types.Proposal) error
 
 	// closed when we finish shutting down
 	done chan struct{}
@@ -180,6 +177,9 @@ type State struct {
 	// proposalReceivedTime tracks when the proposal was received for the current height/round
 	// Used to calculate the duration until full block is received
 	proposalReceivedTime time.Time
+
+	// pacingStarted is set after a local commit establishes the height cadence.
+	pacingStarted bool
 }
 
 // StateOption sets an optional parameter on the State.
@@ -870,6 +870,7 @@ func (cs *State) updateToState(state sm.State) {
 	cs.updateRoundStep(0, cstypes.RoundStepNewHeight)
 
 	if cs.rs.CommitTime.IsZero() {
+		cs.pacingStarted = false
 		// "Now" makes it easier to sync up dev nodes.
 		// We add timeoutCommit to allow transactions
 		// to be gathered for the first block.
@@ -883,11 +884,33 @@ func (cs *State) updateToState(state sm.State) {
 		}
 
 	} else {
-		if state.LastBlockHeight == 0 {
-			cs.rs.StartTime = cs.config.CommitWithCustomTimeout(cs.rs.CommitTime, state.Timeouts.TimeoutCommit)
-		} else {
-			cs.rs.StartTime = cs.config.CommitWithCustomTimeout(cs.rs.CommitTime, cs.state.Timeouts.TimeoutCommit)
+		// Include proposal construction and block execution in the height's
+		// interval. A remote proposal timestamp is neither our start time nor
+		// necessarily on our clock. After slow execution, start from now rather
+		// than carrying an expired deadline into the following height.
+		nextStartTime := cmttime.Now()
+		anchor := cs.rs.StartTime
+		if !cs.pacingStarted || anchor.After(cs.rs.CommitTime) {
+			// Bootstrap from a common event observed on our own clock. An
+			// already committed height must not advance an unused deadline.
+			anchor = cs.rs.CommitTime
 		}
+		timeoutCommit := cs.state.Timeouts.TimeoutCommit
+		if state.LastBlockHeight == 0 {
+			timeoutCommit = state.Timeouts.TimeoutCommit
+		}
+		if timeoutCommit == 0 {
+			timeoutCommit = cs.config.TimeoutCommit
+		}
+		cs.pacingStarted = !cs.propagator.IsBehind()
+		if !anchor.IsZero() && cs.pacingStarted {
+			minStartTime := anchor.Add(timeoutCommit)
+			if nextStartTime.Before(minStartTime) {
+				nextStartTime = minStartTime
+			}
+		}
+
+		cs.rs.StartTime = nextStartTime
 	}
 
 	cs.rs.Validators = validators
@@ -1226,8 +1249,12 @@ func (cs *State) enterNewRound(height int64, round int32) {
 		return
 	}
 
-	if now := cmttime.Now(); cs.rs.StartTime.After(now) {
-		logger.Trace("need to set a buffer and log message here for sanity", "start_time", cs.rs.StartTime, "now", now)
+	if !cs.replayMode && round == 0 && cs.rs.Step == cstypes.RoundStepNewHeight && cmttime.Now().Before(cs.rs.StartTime) &&
+		!cs.propagator.IsBehind() && !cs.rs.Votes.Precommits(round).HasTwoThirdsMajority() {
+		// Receiving all of the previous height's votes must not bypass the
+		// pacing floor. A quorum committing this height can still advance us.
+		cs.scheduleRound0(&cs.rs)
+		return
 	}
 
 	prevHeight, prevRound, prevStep := cs.rs.Height, cs.rs.Round, cs.rs.Step
@@ -1686,25 +1713,6 @@ func (cs *State) enterPrecommit(height int64, round int32) {
 			"entering precommit step with invalid args",
 			"current", log.NewLazySprintf("%v/%v/%v", cs.rs.Height, cs.rs.Round, cs.rs.Step),
 		)
-		return
-	}
-
-	if cs.StartedPrecommitSleep.CompareAndSwap(false, true) {
-		waitTime := cs.precommitDelay()
-		logger.Debug("delaying precommit", "delay", waitTime)
-		cs.unlockAll()
-		t := time.NewTimer(waitTime)
-		select {
-		case <-cs.Quit():
-			cs.lockAll()
-			return
-		case <-t.C:
-		}
-		cs.lockAll()
-		cs.StartedPrecommitSleep.Store(false)
-	} else {
-		logger.Debug("already entered precommit delay")
-		// if any other routine tries to enter precommit, we just return
 		return
 	}
 
@@ -2202,30 +2210,6 @@ func (cs *State) recordMetrics(height int64, block *types.Block) {
 	cs.metrics.CommittedHeight.Set(float64(block.Height))
 }
 
-// KMSSigningDelay is a constant representing a delay used primarily to adjust for KMS signing latencies.
-const KMSSigningDelay = 200 * time.Millisecond
-
-// precommitDelay calculates if the process has waited at least a certain number of seconds
-// from their start time before they can vote.
-// If the application's DelayedPrecommitTimeout is set to 0, no precommit wait is done.
-// When catching up on block data, returns 0 to speed up block processing.
-func (cs *State) precommitDelay() time.Duration {
-	if cs.state.Timeouts.DelayedPrecommitTimeout == 0 {
-		// setting 0 as a special case not to reschedule the pre-commit
-		return 0
-	}
-	// When catching up, skip the delayed precommit timeout to speed up block processing.
-	if cs.propagator.IsCatchingUp() {
-		return 0
-	}
-	precommitVoteTime := cs.rs.StartTime.Add(cs.state.Timeouts.DelayedPrecommitTimeout)
-	waitTime := time.Until(precommitVoteTime)
-	if _, ok := cs.privValidator.(*privval.SignerClient); ok {
-		waitTime = waitTime - KMSSigningDelay
-	}
-	return waitTime
-}
-
 //-----------------------------------------------------------------------------
 
 func (cs *State) defaultSetProposal(proposal *types.Proposal) error {
@@ -2450,7 +2434,9 @@ func (cs *State) handleCompleteProposal(blockHeight int64) {
 		// procedure at this point.
 	}
 
-	if cs.rs.Step <= cstypes.RoundStepPropose && cs.isProposalComplete() {
+	// Cache early proposals during NewHeight until the pacing deadline. WAL
+	// replay must still restore votes and locks created by earlier versions.
+	if (cs.replayMode || cs.rs.Step >= cstypes.RoundStepNewRound) && cs.rs.Step <= cstypes.RoundStepPropose && cs.isProposalComplete() {
 		// Move onto the next step
 		cs.enterPrevote(blockHeight, cs.rs.Round)
 		if hasTwoThirds { // this is optimisation as this will be triggered when prevote is added
