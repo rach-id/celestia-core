@@ -7,8 +7,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/cometbft/cometbft/consensus/propagation"
 	cstypes "github.com/cometbft/cometbft/consensus/types"
+	"github.com/cometbft/cometbft/crypto/tmhash"
+	cmtrand "github.com/cometbft/cometbft/libs/rand"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/cometbft/cometbft/types"
 )
@@ -116,23 +117,94 @@ func TestPacingFirstCommitAlignsLocalStartupTimes(t *testing.T) {
 	}
 }
 
-func TestPacingCatchupResetsCadenceWithoutWaiting(t *testing.T) {
-	now := time.Now()
-	cs := pacingCommittedState(t, now.Add(-200*time.Millisecond), now, now)
-	cs.propagator = pacingBehindPropagator{Propagator: cs.propagator}
+func TestPacingPrecommitQuorumStartsRoundZeroBeforeDeadline(t *testing.T) {
+	cs, vss := randState(4)
+	t.Cleanup(func() { require.NoError(t, cs.eventBus.Stop()) })
+	cs.SetPrivValidator(nil)
+	cs.decideProposal = func(int64, int32) {}
+	cs.rs.StartTime = time.Now().Add(time.Hour)
+	pacingAddPrecommitQuorum(t, cs, vss, 0)
+
+	cs.enterNewRound(cs.rs.Height, 0)
+
+	require.Equal(t, cstypes.RoundStepPropose, cs.rs.Step,
+		"a committing quorum for the height must not be held by the floor")
+}
+
+func TestPacingMultiRoundHeightStartsNextWithinFloorOfCommit(t *testing.T) {
+	const timeoutCommit = time.Second
+	for name, tc := range map[string]struct{ start, commit time.Duration }{
+		"rounds overran the floor": {start: -3 * time.Second, commit: -100 * time.Millisecond},
+		"rounds within the floor":  {start: -300 * time.Millisecond, commit: -50 * time.Millisecond},
+	} {
+		t.Run(name, func(t *testing.T) {
+			now := time.Now()
+			cs, vss := randState(4)
+			t.Cleanup(func() { require.NoError(t, cs.eventBus.Stop()) })
+			cs.state.Timeouts.TimeoutCommit = timeoutCommit
+			cs.pacingStarted = true
+			cs.rs.StartTime = now.Add(tc.start)
+			commit := now.Add(tc.commit)
+
+			pacingCommitHeight(t, cs, vss, 1, commit)
+
+			require.False(t, cs.rs.StartTime.Before(commit), "the next height must not start before the commit")
+			require.False(t, cs.rs.StartTime.After(commit.Add(timeoutCommit)),
+				"a multi-round height must not delay the next one by more than TimeoutCommit")
+		})
+	}
+}
+
+func TestPacingForwardClockJumpRestartsCadence(t *testing.T) {
+	const timeoutCommit = time.Second
+	cs, vss := randState(4)
+	t.Cleanup(func() { require.NoError(t, cs.eventBus.Stop()) })
+	cs.state.Timeouts.TimeoutCommit = timeoutCommit
+	cs.pacingStarted = true
+	// The wall clock jumped an hour forward after the height started.
+	cs.rs.StartTime = time.Now().Add(-time.Hour)
+	before := time.Now()
+
+	pacingCommitHeight(t, cs, vss, 0, cs.rs.StartTime.Add(100*time.Millisecond))
+
+	require.False(t, cs.rs.StartTime.Before(before), "a stale deadline must not be carried past the jump")
+	require.False(t, cs.rs.StartTime.After(time.Now()), "the jump must not add a wait")
+	jumped := cs.rs.StartTime
+
+	pacingCommitHeight(t, cs, vss, 0, jumped.Add(100*time.Millisecond))
+
+	require.Equal(t, jumped.Add(timeoutCommit), cs.rs.StartTime,
+		"the cadence must resume from the post-jump start without a catch-up burst")
+}
+
+// pacingAddPrecommitQuorum adds +2/3 precommits for the current height.
+func pacingAddPrecommitQuorum(t *testing.T, cs *State, vss []*validatorStub, round int32) {
+	t.Helper()
+	ext := cs.state.ConsensusParams.ABCI.VoteExtensionsEnabled(cs.rs.Height)
+	cs.rs.Votes.SetRound(round)
+	header := types.PartSetHeader{Total: 1, Hash: cmtrand.Bytes(tmhash.Size)}
+	for _, vs := range vss[1:] {
+		vs.Height, vs.Round = cs.rs.Height, round
+	}
+	for _, vote := range signVotes(cmtproto.PrecommitType, cmtrand.Bytes(tmhash.Size), header, ext, vss[1:]...) {
+		added, err := cs.rs.Votes.AddVote(vote, "peer", ext)
+		require.NoError(t, err)
+		require.True(t, added)
+	}
+}
+
+// pacingCommitHeight commits the current height at round and commit time,
+// then moves to the next height as finalizeCommit does.
+func pacingCommitHeight(t *testing.T, cs *State, vss []*validatorStub, round int32, commit time.Time) {
+	t.Helper()
+	pacingAddPrecommitQuorum(t, cs, vss, round)
+	cs.rs.CommitRound = round
+	cs.rs.CommitTime = commit
 	nextState := cs.state.Copy()
 	nextState.LastBlockHeight = cs.rs.Height
 	nextState.LastValidators = cs.rs.Validators
-
 	cs.updateToState(nextState)
-
-	require.False(t, cs.rs.StartTime.After(time.Now()), "catch-up must not wait for live block pacing")
-	require.False(t, cs.pacingStarted, "the first live commit after catch-up must establish a fresh cadence")
 }
-
-type pacingBehindPropagator struct{ propagation.Propagator }
-
-func (pacingBehindPropagator) IsBehind() bool { return true }
 
 func TestPacingAllLastCommitVotesDoNotSkipHeightStart(t *testing.T) {
 	cs, vss := randState(4)
@@ -152,7 +224,7 @@ func TestPacingAllLastCommitVotesDoNotSkipHeightStart(t *testing.T) {
 	cs.rs.Votes = cstypes.NewHeightVoteSet(cs.state.ChainID, cs.rs.Height, cs.rs.Validators)
 	cs.rs.StartTime = time.Now().Add(time.Hour)
 	cs.rs.Step = cstypes.RoundStepNewHeight
-	cs.config.SkipTimeoutCommit = true
+	cs.config.SkipTimeoutCommit = true //nolint:staticcheck // the ignored setting must not skip the floor
 	cs.SetPrivValidator(nil)
 
 	added, err := cs.addVote(vote, "peer")

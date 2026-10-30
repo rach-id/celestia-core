@@ -347,12 +347,7 @@ peer you send the tx to will see it until it is included in a block.
 
 - `consensus.skip_timeout_commit`
 
-We want `skip_timeout_commit=false` when there is economics on the line
-because proposers should wait to hear for more votes. But if you don't
-care about that and want the fastest consensus, you can skip it. It will
-be kept false by default for public deployments (e.g. [Cosmos
-Hub](https://hub.cosmos.network/)) while for enterprise
-applications, setting it to true is not a problem.
+Deprecated and ignored: heights are always paced by `timeout_commit`.
 
 - `consensus.peer_gossip_sleep_duration`
 
@@ -361,8 +356,10 @@ theres something to send its peers.
 
 - `consensus.timeout_commit`
 
-You can also try lowering `timeout_commit` (time we sleep before
-proposing the next block).
+You can also try lowering `timeout_commit`, the minimum interval between
+the start times of consecutive heights (see [Consensus timeouts
+explained](./configuration.md#timeout_commit-as-a-floor-on-the-block-interval)).
+The application's `TimeoutInfo` value takes precedence when it is non-zero.
 
 - `p2p.addr_book_strict`
 

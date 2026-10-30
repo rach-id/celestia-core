@@ -550,9 +550,9 @@ timeout_precommit = "{{ .Consensus.TimeoutPrecommit }}"
 # How much the timeout_precommit increases with each round
 # DEPRECATED: timeout_precommit_delta is deprecated and will be removed in a future version.
 timeout_precommit_delta = "{{ .Consensus.TimeoutPrecommitDelta }}"
-# How long we wait after committing a block, before starting on the new
-# height (this gives us a chance to receive some more precommits, even
-# though we already have +2/3).
+# Minimum interval between the start times of consecutive heights: a height
+# starts at max(now, previous start time + timeout_commit). Only used when the
+# application returns no timeout_commit.
 timeout_commit = "{{ .Consensus.TimeoutCommit }}"
 
 # How many blocks to look back to check existence of the node's consensus votes before joining consensus
@@ -561,7 +561,7 @@ timeout_commit = "{{ .Consensus.TimeoutCommit }}"
 # So, validators should stop the state machine, wait for some blocks, and then restart the state machine to avoid panic.
 double_sign_check_height = {{ .Consensus.DoubleSignCheckHeight }}
 
-# Make progress as soon as we have all the precommits (as if TimeoutCommit = 0)
+# DEPRECATED: skip_timeout_commit is ignored; heights are paced by timeout_commit.
 skip_timeout_commit = {{ .Consensus.SkipTimeoutCommit }}
 
 # EmptyBlocks mode and possible interval between empty blocks

@@ -122,14 +122,13 @@ func DefaultConfig(dir string) *Config {
 // Uses the same timeouts as the default consensus config for production-like testing
 func (app *Application) timeoutInfo() abci.TimeoutInfo {
 	return abci.TimeoutInfo{
-		TimeoutPropose:          3000 * time.Millisecond,
-		TimeoutCommit:           1000 * time.Millisecond,
-		TimeoutProposeDelta:     500 * time.Millisecond,
-		TimeoutPrevote:          1000 * time.Millisecond,
-		TimeoutPrevoteDelta:     500 * time.Millisecond,
-		TimeoutPrecommit:        1000 * time.Millisecond,
-		TimeoutPrecommitDelta:   500 * time.Millisecond,
-		DelayedPrecommitTimeout: 20 * time.Millisecond, // e2e uses this specific value
+		TimeoutPropose:        3000 * time.Millisecond,
+		TimeoutCommit:         1000 * time.Millisecond,
+		TimeoutProposeDelta:   500 * time.Millisecond,
+		TimeoutPrevote:        1000 * time.Millisecond,
+		TimeoutPrevoteDelta:   500 * time.Millisecond,
+		TimeoutPrecommit:      1000 * time.Millisecond,
+		TimeoutPrecommitDelta: 500 * time.Millisecond,
 	}
 }
 

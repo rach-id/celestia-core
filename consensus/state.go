@@ -389,6 +389,9 @@ func (cs *State) OnStart() error {
 	}
 
 	cs.metrics.Height.Set(float64(cs.rs.Height))
+	if cs.config.SkipTimeoutCommit { //nolint:staticcheck // warn about the ignored setting
+		cs.Logger.Info("skip_timeout_commit is deprecated and ignored: timeout_commit is the minimum block interval")
+	}
 
 	// we need the timeoutRoutine for replay so
 	// we don't block on the tick chan.
@@ -902,12 +905,13 @@ func (cs *State) updateToState(state sm.State) {
 		if timeoutCommit == 0 {
 			timeoutCommit = cs.config.TimeoutCommit
 		}
-		cs.pacingStarted = !cs.propagator.IsBehind()
-		if !anchor.IsZero() && cs.pacingStarted {
-			minStartTime := anchor.Add(timeoutCommit)
-			if nextStartTime.Before(minStartTime) {
-				nextStartTime = minStartTime
-			}
+		cs.pacingStarted = true
+		if wait := anchor.Add(timeoutCommit).Sub(nextStartTime); wait > 0 {
+			nextStartTime = nextStartTime.Add(wait)
+			cs.metrics.PacingFloorWaitSeconds.Observe(wait.Seconds())
+		} else {
+			cs.metrics.PacingFloorWaitSeconds.Observe(0)
+			cs.metrics.PacingBypass.With("reason", "slow").Add(1)
 		}
 
 		cs.rs.StartTime = nextStartTime
@@ -1230,9 +1234,9 @@ func (cs *State) handleTxsAvailable() {
 // State functions
 // Used internally by handleTimeout and handleMsg to make state transitions
 
-// Enter: `timeoutNewHeight` by startTime (commitTime+timeoutCommit),
+// Enter: `timeoutNewHeight` by startTime (previous startTime+timeoutCommit),
 //
-//	or, if SkipTimeoutCommit==true, after receiving all precommits from (height,round-1)
+//	or, before it, once +2/3 precommits for (height,0) are seen
 //
 // Enter: `timeoutPrecommits` after any +2/3 precommits from (height,round-1)
 // Enter: +2/3 precommits for nil at (height,round-1)
@@ -1249,12 +1253,15 @@ func (cs *State) enterNewRound(height int64, round int32) {
 		return
 	}
 
-	if !cs.replayMode && round == 0 && cs.rs.Step == cstypes.RoundStepNewHeight && cmttime.Now().Before(cs.rs.StartTime) &&
-		!cs.propagator.IsBehind() && !cs.rs.Votes.Precommits(round).HasTwoThirdsMajority() {
-		// Receiving all of the previous height's votes must not bypass the
-		// pacing floor. A quorum committing this height can still advance us.
-		cs.scheduleRound0(&cs.rs)
-		return
+	if !cs.replayMode && round == 0 && cs.rs.Step == cstypes.RoundStepNewHeight && cmttime.Now().Before(cs.rs.StartTime) {
+		// +2/3 precommits for this height start the round at once. Catch-up never
+		// waits: a precommit quorum commits from any step (see addVote).
+		if !cs.rs.Votes.Precommits(round).HasTwoThirdsMajority() {
+			logger.Debug("deferring round 0 until the height start time", "start_time", cs.rs.StartTime)
+			cs.scheduleRound0(&cs.rs)
+			return
+		}
+		cs.metrics.PacingBypass.With("reason", "quorum").Add(1)
 	}
 
 	prevHeight, prevRound, prevStep := cs.rs.Height, cs.rs.Round, cs.rs.Step
@@ -2550,13 +2557,6 @@ func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error
 
 		cs.evsw.FireEvent(types.EventVote, vote)
 
-		// if we can skip timeoutCommit and have all the votes now,
-		if cs.config.SkipTimeoutCommit && cs.rs.LastCommit.HasAll() {
-			// go straight to new round (skip timeout commit)
-			// cs.scheduleTimeout(time.Duration(0), cs.rs.Height, 0, cstypes.RoundStepNewHeight)
-			cs.enterNewRound(cs.rs.Height, 0)
-		}
-
 		return added, err
 	}
 
@@ -2747,9 +2747,6 @@ func (cs *State) addVote(vote *types.Vote, peerID p2p.ID) (added bool, err error
 
 			if len(blockID.Hash) != 0 {
 				cs.enterCommit(height, vote.Round)
-				if cs.config.SkipTimeoutCommit && precommits.HasAll() {
-					cs.enterNewRound(cs.rs.Height, 0)
-				}
 			} else {
 				cs.enterPrecommitWait(height, vote.Round)
 			}

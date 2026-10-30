@@ -1218,17 +1218,15 @@ type ConsensusConfig struct {
 	// How much the timeout_precommit increases with each round
 	// Deprecated: TimeoutPrecommitDelta is deprecated and will be removed in a future version.
 	TimeoutPrecommitDelta time.Duration `mapstructure:"timeout_precommit_delta"`
-	// DelayedPrecommitTimeout ensures a minimum block time by waiting during the pre-commit time.
-	// The new pre-commit vote time starts at: StartTime (the new block start time) + the delayed pre-commit time.
-	//  Note that this change doesn't affect the rounds >= 1.
-	DelayedPrecommitTimeout time.Duration // TODO dynamically change using the app
-	// How long we wait after committing a block, before starting on the new
-	// height (this gives us a chance to receive some more precommits, even
-	// though we already have +2/3).
-	// NOTE: when modifying, make sure to update time_iota_ms genesis parameter
+	// Deprecated: DelayedPrecommitTimeout is ignored. TimeoutCommit is the
+	// minimum block interval.
+	DelayedPrecommitTimeout time.Duration
+	// Minimum interval between the start times of consecutive heights: a height
+	// starts at max(now, previous start time + TimeoutCommit). Only used when
+	// the application returns no TimeoutCommit.
 	TimeoutCommit time.Duration `mapstructure:"timeout_commit"`
 
-	// Make progress as soon as we have all the precommits (as if TimeoutCommit = 0)
+	// Deprecated: SkipTimeoutCommit is ignored. Heights are paced by TimeoutCommit.
 	SkipTimeoutCommit bool `mapstructure:"skip_timeout_commit"`
 
 	// EmptyBlocks mode and possible interval between empty blocks
@@ -1259,7 +1257,6 @@ func DefaultConsensusConfig() *ConsensusConfig {
 		TimeoutPrecommit:            1000 * time.Millisecond,
 		TimeoutPrecommitDelta:       500 * time.Millisecond,
 		TimeoutCommit:               1000 * time.Millisecond,
-		DelayedPrecommitTimeout:     1000 * time.Millisecond,
 		SkipTimeoutCommit:           false,
 		CreateEmptyBlocks:           true,
 		CreateEmptyBlocksInterval:   0 * time.Second,
@@ -1281,10 +1278,8 @@ func TestConsensusConfig() *ConsensusConfig {
 	cfg.TimeoutPrevoteDelta = 1 * time.Millisecond
 	cfg.TimeoutPrecommit = 10 * time.Millisecond
 	cfg.TimeoutPrecommitDelta = 1 * time.Millisecond
-	cfg.DelayedPrecommitTimeout = 0
 	// NOTE: when modifying, make sure to update time_iota_ms (testGenesisFmt) in toml.go
 	cfg.TimeoutCommit = 10 * time.Millisecond
-	cfg.SkipTimeoutCommit = true
 	cfg.PeerGossipSleepDuration = 5 * time.Millisecond
 	cfg.PeerQueryMaj23SleepDuration = 250 * time.Millisecond
 	cfg.DoubleSignCheckHeight = int64(0)

@@ -331,7 +331,7 @@ func (blockProp *Reactor) setHeightAndRoundLocked(height int64, round int32) {
 	blockProp.height = height
 
 	// If we already have a verified proposal cached for the current height
-	// (committed height + 1), treat it as catchup so delayed precommit is skipped.
+	// (committed height + 1), treat it as catchup.
 	if height > prevHeight && height == committedHeight+1 {
 		if props, ok := blockProp.proposals[height]; ok {
 			for _, prop := range props {
@@ -457,11 +457,4 @@ func (r *Reactor) IsCatchingUp() bool {
 	}
 
 	return false
-}
-
-// IsBehind returns true if a proposal is cached at least two heights above
-// the committed height. A node behind by a single height is not behind: the
-// live network is never more than one height ahead of a node keeping up.
-func (r *Reactor) IsBehind() bool {
-	return r.hasProposalAbove(r.store.Height() + 1)
 }

@@ -419,9 +419,9 @@ timeout_prevote_delta = "500ms"
 timeout_precommit = "1s"
 # How much the timeout_precommit increases with each round
 timeout_precommit_delta = "500ms"
-# How long we wait after committing a block, before starting on the new
-# height (this gives us a chance to receive some more precommits, even
-# though we already have +2/3).
+# Minimum interval between the start times of consecutive heights: a height
+# starts at max(now, previous start time + timeout_commit). Only used when the
+# application returns no timeout_commit.
 timeout_commit = "1s"
 
 # How many blocks to look back to check existence of the node's consensus votes before joining consensus
@@ -430,7 +430,7 @@ timeout_commit = "1s"
 # So, validators should stop the state machine, wait for some blocks, and then restart the state machine to avoid panic.
 double_sign_check_height = 0
 
-# Make progress as soon as we have all the precommits (as if TimeoutCommit = 0)
+# DEPRECATED: skip_timeout_commit is ignored; heights are paced by timeout_commit.
 skip_timeout_commit = false
 
 # EmptyBlocks mode and possible interval between empty blocks
@@ -534,7 +534,8 @@ timeout_commit = "1s"
 ```
 
 Note that in a successful round, the only timeout that we absolutely wait no
-matter what is `timeout_commit`.
+matter what is `timeout_commit`, and it is a floor on the block interval rather
+than a sleep after the commit (see below).
 Here's a brief summary of the timeouts:
 
 - `timeout_propose` = how long a validator should wait for a proposal block before prevoting nil
@@ -545,9 +546,23 @@ Here's a brief summary of the timeouts:
 - `timeout_precommit` = how long a validator should wait after receiving +2/3 precommits for
   anything (ie. not a single block or nil)
 - `timeout_precommit_delta` = how much the `timeout_precommit` increases with each round
-- `timeout_commit` = how long a validator should wait after committing a block, before starting
-  on the new height (this gives us a chance to receive some more precommits,
-  even though we already have +2/3)
+- `timeout_commit` = the minimum interval between the start times of two consecutive heights
+
+### `timeout_commit` as a floor on the block interval
+
+A node starts height `H+1` at `max(now, StartTime(H) + timeout_commit)`, where
+`StartTime(H)` is when it started height `H` on its own clock. Proposal
+construction, voting and block execution all count towards the interval, so a
+height that already took longer than `timeout_commit` starts the next one
+immediately and a loaded block pays only for its own work. Round 0 does not
+start before the deadline, and a complete proposal received earlier is held
+until then. A +2/3 precommit quorum for the height is never held: the node
+commits on it from any step, which is how a node that is behind catches up
+without waiting at every height.
+
+The application can set `timeout_commit` per block in `TimeoutInfo`; the value
+in this file is only used when the application returns zero.
+`skip_timeout_commit` and the delayed precommit timeout are ignored.
 
 ### The adverse effect of using inconsistent `timeout_propose` in a network
 

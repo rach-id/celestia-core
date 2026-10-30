@@ -835,15 +835,11 @@ func TestReactorValidatorSetChanges(t *testing.T) {
 	})
 }
 
-// Check we can make blocks with skip_timeout_commit=false
+// Check we can make blocks with a validator offline
 func TestReactorWithTimeoutCommit(t *testing.T) {
 	N := 4
 	css, cleanup := randConsensusNet(t, N, "consensus_reactor_with_timeout_commit_test", newHeightOnlyTicker, newKVStore)
 	defer cleanup()
-	// override default SkipTimeoutCommit == true for tests
-	for i := 0; i < N; i++ {
-		css[i].config.SkipTimeoutCommit = false
-	}
 
 	reactors, blocksSubs, eventBuses := startConsensusNet(t, css, N-1)
 	defer stopConsensusNet(log.TestingLogger(), reactors, eventBuses)
