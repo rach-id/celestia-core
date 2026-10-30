@@ -648,6 +648,14 @@ func (cs *State) updateRoundStep(round int32, step cstypes.RoundStepType) {
 	}
 }
 
+// timeoutCommit returns the application's TimeoutCommit, or the config's if unset.
+func (cs *State) timeoutCommit() time.Duration {
+	if tc := cs.state.Timeouts.TimeoutCommit; tc != 0 {
+		return tc
+	}
+	return cs.config.TimeoutCommit
+}
+
 // enterNewRound(height, 0) at cs.StartTime.
 func (cs *State) scheduleRound0(rs *cstypes.RoundState) {
 	// cs.Logger.Info("scheduleRound0", "now", cmttime.Now(), "startTime", cs.StartTime)
@@ -887,10 +895,8 @@ func (cs *State) updateToState(state sm.State) {
 		}
 
 	} else {
-		// Include proposal construction and block execution in the height's
-		// interval. A remote proposal timestamp is neither our start time nor
-		// necessarily on our clock. After slow execution, start from now rather
-		// than carrying an expired deadline into the following height.
+		// The interval includes proposal, voting and execution, on our own clock.
+		// After a slow height, start now rather than carry an expired deadline.
 		nextStartTime := cmttime.Now()
 		anchor := cs.rs.StartTime
 		if !cs.pacingStarted || anchor.After(cs.rs.CommitTime) {
@@ -1236,7 +1242,7 @@ func (cs *State) handleTxsAvailable() {
 
 // Enter: `timeoutNewHeight` by startTime (previous startTime+timeoutCommit),
 //
-//	or, before it, once +2/3 precommits for (height,0) are seen
+//	or, before it, once +2/3 precommits of any kind for (height,0) are seen
 //
 // Enter: `timeoutPrecommits` after any +2/3 precommits from (height,round-1)
 // Enter: +2/3 precommits for nil at (height,round-1)
@@ -1253,10 +1259,14 @@ func (cs *State) enterNewRound(height int64, round int32) {
 		return
 	}
 
-	if !cs.replayMode && round == 0 && cs.rs.Step == cstypes.RoundStepNewHeight && cmttime.Now().Before(cs.rs.StartTime) {
+	if now := cmttime.Now(); !cs.replayMode && round == 0 && now.Before(cs.rs.StartTime) {
 		// +2/3 precommits for this height start the round at once. Catch-up never
 		// waits: a precommit quorum commits from any step (see addVote).
-		if !cs.rs.Votes.Precommits(round).HasTwoThirdsMajority() {
+		if !cs.rs.Votes.Precommits(round).HasTwoThirdsAny() {
+			// A backward clock step must not hold round 0 longer than one floor.
+			if limit := now.Add(cs.timeoutCommit()); cs.rs.StartTime.After(limit) {
+				cs.rs.StartTime = limit
+			}
 			logger.Debug("deferring round 0 until the height start time", "start_time", cs.rs.StartTime)
 			cs.scheduleRound0(&cs.rs)
 			return
@@ -1319,7 +1329,8 @@ func (cs *State) enterNewRound(height int64, round int32) {
 	// Wait for txs to be available in the mempool
 	// before we enterPropose in round 0. If the last block changed the app hash,
 	// we may need an empty "proof" block, and enterPropose immediately.
-	waitForTxs := cs.config.WaitForTxs() && round == 0 && !cs.needProofBlock(height)
+	// A proposal held until the start time is processed without waiting for txs.
+	waitForTxs := cs.config.WaitForTxs() && round == 0 && !cs.needProofBlock(height) && !cs.isProposalComplete()
 	if waitForTxs {
 		if cs.config.CreateEmptyBlocksInterval > 0 {
 			cs.scheduleTimeout(cs.config.CreateEmptyBlocksInterval, height, round,

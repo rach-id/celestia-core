@@ -556,9 +556,14 @@ construction, voting and block execution all count towards the interval, so a
 height that already took longer than `timeout_commit` starts the next one
 immediately and a loaded block pays only for its own work. Round 0 does not
 start before the deadline, and a complete proposal received earlier is held
-until then. A +2/3 precommit quorum for the height is never held: the node
-commits on it from any step, which is how a node that is behind catches up
-without waiting at every height.
+until then. +2/3 precommits for the height are never held: the node commits on a
++2/3 majority from any step, which is how a node that is behind catches up
+without waiting at every height. The floor is per node, start to start on its
+own clock: nodes that started a height at different times keep that offset, so
+the network-wide interval is `timeout_commit` on average, not at every height.
+After the commit, a validator whose precommit arrives later than
+`timeout_commit - (round time + execution)` may be absent from the next
+`LastCommit`, as it may be with any short `timeout_commit`.
 
 The application can set `timeout_commit` per block in `TimeoutInfo`; the value
 in this file is only used when the application returns zero.

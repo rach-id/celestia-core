@@ -62,7 +62,7 @@ parameters over each successive round.
 
 ```md
                          +-------------------------------------+
-                         v                                     |(Wait til `CommmitTime+timeoutCommit`)
+                         v                                     |(Wait til `StartTime(H-1)+timeoutCommit`)
                    +-----------+                         +-----+-----+
       +----------> |  Propose  +--------------+          | NewHeight |
       |            +-----------+              |          +-----------+
@@ -203,8 +203,9 @@ The Precommit step ends:
 ### NewHeight Step (height:H)
 
 - Move `Precommits` to `LastCommit` and increment height.
-- Set `StartTime = CommitTime+timeoutCommit`
-- Wait until `StartTime` to receive straggler commits. --> goto
+- Set `StartTime = max(now, StartTime(H-1)+timeoutCommit)` (`CommitTime+timeoutCommit`
+  on the first height after start-up or when `H-1` was committed before its `StartTime`)
+- Wait until `StartTime`, or until +2/3 precommits for `(H,0)` are seen. --> goto
   `Propose(H,0)`
 
 ## Proofs

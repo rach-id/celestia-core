@@ -65,6 +65,30 @@ func TestPacingWALReplayRestoresRoundBeforeStartupDeadline(t *testing.T) {
 		"historical WAL events must restore the prior step without waiting for the new startup deadline")
 }
 
+func TestPacingWALReplayEntersRoundZeroBeforeStartupDeadline(t *testing.T) {
+	state, privVals := randGenesisState(4, false, 10, test.ConsensusParams())
+	state.Timeouts.TimeoutCommit = time.Hour
+	cs := newState(state, privVals[0], kvstore.NewInMemoryApplication())
+	t.Cleanup(func() { require.NoError(t, cs.eventBus.Stop()) })
+	cs.SetPrivValidator(nil)
+	require.True(t, time.Now().Before(cs.rs.StartTime))
+
+	wal, err := NewWAL(filepath.Join(t.TempDir(), "wal"))
+	require.NoError(t, err)
+	require.NoError(t, wal.Start())
+	t.Cleanup(func() {
+		require.NoError(t, wal.Stop())
+		wal.Wait()
+	})
+	cs.wal = wal
+	// The height had started before the crash, so replay must not wait again.
+	require.NoError(t, wal.Write(timeoutInfo{Height: cs.rs.Height, Round: 0, Step: cstypes.RoundStepNewHeight}))
+	require.NoError(t, wal.FlushAndSync())
+
+	require.NoError(t, cs.catchupReplay(cs.rs.Height))
+	require.Equal(t, cstypes.RoundStepPropose, cs.rs.Step)
+}
+
 func TestPacingWALReplayRestoresLegacyEarlyProposalLock(t *testing.T) {
 	state, privVals := randGenesisState(4, false, 10, test.ConsensusParams())
 	state.Timeouts.TimeoutCommit = time.Hour

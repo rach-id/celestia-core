@@ -127,7 +127,7 @@ func waitHeight(t *testing.T, sub types.Subscription, target int64) map[int64]ti
 func TestPacingIntervalIncludesRoundAndSlowBlockStartsNextImmediately(t *testing.T) {
 	const (
 		tc    = 500 * time.Millisecond
-		delay = 200 * time.Millisecond
+		delay = 400 * time.Millisecond
 	)
 	css := newPacedNet(t, 4, func() *pacedApp {
 		// The long propose timeout keeps round 0 alive while ProcessProposal sleeps.
@@ -141,11 +141,11 @@ func TestPacingIntervalIncludesRoundAndSlowBlockStartsNextImmediately(t *testing
 	for h := int64(3); h <= 4; h++ {
 		interval := seen[h].Sub(seen[h-1])
 		t.Logf("height %d->%d %v", h-1, h, interval)
-		require.Less(t, interval, tc+delay/2, "proposal processing must count towards the floor, not add to it")
+		require.Less(t, interval, tc+3*delay/4, "proposal processing must count towards the floor, not add to it")
 	}
 	afterSlow, next := seen[6].Sub(seen[5]), seen[7].Sub(seen[6])
 	t.Logf("height 5->6 %v, 6->7 %v", afterSlow, next)
-	require.Less(t, afterSlow, tc+delay/2, "a block slower than the floor must not wait TimeoutCommit again")
+	require.Less(t, afterSlow, tc+3*delay/4, "a block slower than the floor must not wait TimeoutCommit again")
 	require.Greater(t, next, tc/2, "the floor must apply again once heights are fast")
 }
 

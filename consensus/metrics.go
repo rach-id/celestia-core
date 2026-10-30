@@ -159,7 +159,7 @@ type Metrics struct {
 	ProposerMissedProposals metrics.Counter `metrics_labels:"proposer_address"`
 
 	// PacingFloorWaitSeconds is how long a new height waits for its start time
-	// (previous start time + TimeoutCommit) after the previous commit.
+	// (previous start time + TimeoutCommit) once the previous block is applied.
 	PacingFloorWaitSeconds metrics.Histogram `metrics_buckettype:"exprange" metrics_bucketsizes:"0.001, 10, 14"`
 	// PacingBypass counts heights not held by the floor, by reason: slow when
 	// the previous height ended after it, quorum when +2/3 precommits came first.

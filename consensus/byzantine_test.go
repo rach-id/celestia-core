@@ -140,12 +140,8 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 		require.NoError(t, err)
 		cs.SetEventBus(eventBus)
 
-		// Keep real height deadlines but disable round timers, which race with
-		// proposal gossip: if TimeoutPropose fires on the
-		// byzantine before the proposal arrives, doPrevote runs without a proposal
-		// block and prevote1 collapses to a vote for nil identical to prevote2.
-		// Height-only timers eliminate that race; each height advances through
-		// voting quorums, keeping the equivocation detection path deterministic.
+		// Height-only timers: a TimeoutPropose firing before the proposal arrives
+		// would collapse prevote1 into a nil vote identical to prevote2.
 		cs.SetTimeoutTicker(newHeightOnlyTicker())
 		cs.SetLogger(logger)
 
@@ -297,9 +293,8 @@ func TestByzantinePrevoteEquivocation(t *testing.T) {
 			return
 		}
 
-		// Omit a surplus signature that changes the commit timestamp. A paced
-		// height can begin with only a quorum, so keep that commit unchanged
-		// and require a later proposal to exercise the timestamp divergence.
+		// Omit a surplus signature that changes the median time. A paced height
+		// can start with only a quorum, so a later proposal may be needed.
 		if !assert.NotEmpty(t, extCommit.ExtendedSignatures, "lazyProposer: expected non-empty ExtendedSignatures") {
 			return
 		}

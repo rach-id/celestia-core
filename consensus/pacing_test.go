@@ -7,10 +7,12 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/cometbft/cometbft/consensus/propagation"
 	cstypes "github.com/cometbft/cometbft/consensus/types"
 	"github.com/cometbft/cometbft/crypto/tmhash"
 	cmtrand "github.com/cometbft/cometbft/libs/rand"
 	cmtproto "github.com/cometbft/cometbft/proto/tendermint/types"
+	sm "github.com/cometbft/cometbft/state"
 	"github.com/cometbft/cometbft/types"
 )
 
@@ -175,6 +177,84 @@ func TestPacingForwardClockJumpRestartsCadence(t *testing.T) {
 
 	require.Equal(t, jumped.Add(timeoutCommit), cs.rs.StartTime,
 		"the cadence must resume from the post-jump start without a catch-up burst")
+}
+
+func TestPacingAnyPrecommitQuorumStartsRoundZeroBeforeDeadline(t *testing.T) {
+	cs, vss := randState(4)
+	t.Cleanup(func() { require.NoError(t, cs.eventBus.Stop()) })
+	cs.SetPrivValidator(nil)
+	cs.decideProposal = func(int64, int32) {}
+	recorder := &recordingPropagator{NoOpPropagator: propagation.NewNoOpPropagator()}
+	cs.propagator = recorder
+	cs.rs.StartTime = time.Now().Add(time.Hour)
+	ext := cs.state.ConsensusParams.ABCI.VoteExtensionsEnabled(cs.rs.Height)
+	header := types.PartSetHeader{Total: 1, Hash: cmtrand.Bytes(tmhash.Size)}
+	for _, vs := range vss[1:] {
+		vs.Height, vs.Round = cs.rs.Height, 0
+	}
+	// +2/3 precommits without a majority: two for a block, one for nil.
+	votes := signVotes(cmtproto.PrecommitType, cmtrand.Bytes(tmhash.Size), header, ext, vss[1:3]...)
+	votes = append(votes, signVotes(cmtproto.PrecommitType, nil, types.PartSetHeader{}, ext, vss[3])...)
+	for _, vote := range votes {
+		_, err := cs.addVote(vote, "peer")
+		require.NoError(t, err)
+	}
+
+	calls := recorder.snapshotCalls()
+	require.NotEmpty(t, calls, "round 0 must start before moving to the precommit wait")
+	require.Equal(t, proposerAndRoundCall{height: cs.rs.Height, round: 0, proposer: calls[0].proposer}, calls[0])
+	require.Equal(t, cstypes.RoundStepPrecommitWait, cs.rs.Step)
+}
+
+func TestPacingHeldProposalPrevotedWhenWaitingForTxs(t *testing.T) {
+	cs, _ := randState(4)
+	t.Cleanup(func() { require.NoError(t, cs.eventBus.Stop()) })
+	cs.config.CreateEmptyBlocks = false
+	block, parts, err := cs.createProposalBlock(context.Background())
+	require.NoError(t, err)
+	cs.state.InitialHeight = cs.rs.Height + 100
+	cs.blockStore = pacingNoProofStore{BlockStore: cs.blockStore, appHash: cs.state.AppHash}
+	require.False(t, cs.needProofBlock(cs.rs.Height))
+	cs.rs.Proposal = types.NewProposal(cs.rs.Height, 0, -1,
+		types.BlockID{Hash: block.Hash(), PartSetHeader: parts.Header()})
+	cs.rs.ProposalBlock = block
+	cs.rs.ProposalBlockParts = parts
+	cs.rs.StartTime = time.Now().Add(time.Hour)
+	prevoted := false
+	cs.doPrevote = func(int64, int32) { prevoted = true }
+	cs.decideProposal = func(int64, int32) {}
+
+	cs.handleCompleteProposal(cs.rs.Height)
+	require.False(t, prevoted)
+	cs.rs.StartTime = time.Now().Add(-time.Second)
+	cs.enterNewRound(cs.rs.Height, 0)
+
+	require.True(t, prevoted, "a held proposal must not wait for mempool txs once the round starts")
+}
+
+// pacingNoProofStore reports an unchanged app hash, so no proof block is needed.
+type pacingNoProofStore struct {
+	sm.BlockStore
+	appHash []byte
+}
+
+func (s pacingNoProofStore) LoadBlockMeta(int64) *types.BlockMeta {
+	return &types.BlockMeta{Header: types.Header{AppHash: s.appHash}}
+}
+
+func TestPacingBackwardClockStepBoundsDeferral(t *testing.T) {
+	cs, _ := randState(4)
+	t.Cleanup(func() { require.NoError(t, cs.eventBus.Stop()) })
+	cs.SetPrivValidator(nil)
+	cs.state.Timeouts.TimeoutCommit = time.Second
+	// A start time an hour ahead models the wall clock stepping back an hour.
+	cs.rs.StartTime = time.Now().Add(time.Hour)
+
+	cs.enterNewRound(cs.rs.Height, 0)
+
+	require.Equal(t, cstypes.RoundStepNewHeight, cs.rs.Step)
+	require.False(t, cs.rs.StartTime.After(time.Now().Add(time.Second)),
+		"round 0 must not be held longer than one TimeoutCommit")
 }
 
 // pacingAddPrecommitQuorum adds +2/3 precommits for the current height.
