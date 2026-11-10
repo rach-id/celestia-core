@@ -553,6 +553,7 @@ func (txmp *TxPool) UpdateAsyncRecheck(
 		return txmp.Update(blockHeight, blockTxs, deliverTxResponses, newPreFn, newPostFn)
 	}
 	if txmp.recheckLate {
+		benchstep.Since(blockHeight, "recheck_late", time.Now(), 0)
 		// A sync pass gives admission the whole next interval, as before async recheck.
 		txmp.metrics.RecheckLateCommits.Add(1)
 		return txmp.Update(blockHeight, blockTxs, deliverTxResponses, newPreFn, newPostFn)
@@ -565,6 +566,7 @@ func (txmp *TxPool) UpdateAsyncRecheck(
 	handedOff = true
 	go func() {
 		defer unlock()
+		defer benchstep.Since(blockHeight, "recheck_async", time.Now(), 0)
 		txmp.recheckTransactions()
 		txmp.signalHeight()
 		txmp.rechecking.Store(false)

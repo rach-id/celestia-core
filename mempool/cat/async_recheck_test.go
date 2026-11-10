@@ -20,9 +20,9 @@ import (
 	"github.com/cometbft/cometbft/types"
 )
 
-// seqApp models an SDK app's check state: Commit resets it to the committed
+// asyncSeqApp models an SDK app's check state: Commit resets it to the committed
 // sequences and recheck replays pending txs in order. Txs are "signer/seq".
-type seqApp struct {
+type asyncSeqApp struct {
 	abci.BaseApplication
 
 	mtx       sync.Mutex
@@ -36,11 +36,11 @@ type seqApp struct {
 	recheckDelay time.Duration
 }
 
-func newSeqApp() *seqApp {
-	return &seqApp{committed: map[string]uint64{}, check: map[string]uint64{}}
+func newAsyncSeqApp() *asyncSeqApp {
+	return &asyncSeqApp{committed: map[string]uint64{}, check: map[string]uint64{}}
 }
 
-func seqTx(signer string, seq uint64) types.Tx {
+func asyncSeqTx(signer string, seq uint64) types.Tx {
 	return types.Tx(fmt.Sprintf("%s/%d", signer, seq))
 }
 
@@ -53,7 +53,7 @@ func parseSeqTx(tx []byte) (string, uint64) {
 	return parts[0], seq
 }
 
-func (app *seqApp) CheckTx(_ context.Context, req *abci.RequestCheckTx) (*abci.ResponseCheckTx, error) {
+func (app *asyncSeqApp) CheckTx(_ context.Context, req *abci.RequestCheckTx) (*abci.ResponseCheckTx, error) {
 	app.inflight.Add(1)
 	defer app.inflight.Add(-1)
 	if req.Type == abci.CheckTxType_Recheck {
@@ -77,7 +77,7 @@ func (app *seqApp) CheckTx(_ context.Context, req *abci.RequestCheckTx) (*abci.R
 	return &abci.ResponseCheckTx{Code: abci.CodeTypeOK, GasWanted: 1, Address: []byte(signer), Sequence: seq}, nil
 }
 
-func (app *seqApp) QuerySequence(_ context.Context, req *abci.RequestQuerySequence) (*abci.ResponseQuerySequence, error) {
+func (app *asyncSeqApp) QuerySequence(_ context.Context, req *abci.RequestQuerySequence) (*abci.ResponseQuerySequence, error) {
 	app.mtx.Lock()
 	defer app.mtx.Unlock()
 	seq, ok := app.check[string(req.Signer)]
@@ -88,7 +88,7 @@ func (app *seqApp) QuerySequence(_ context.Context, req *abci.RequestQuerySequen
 }
 
 // commit applies the block and resets the check state, like BaseApp.Commit.
-func (app *seqApp) commit(txs []types.Tx) {
+func (app *asyncSeqApp) commit(txs []types.Tx) {
 	if app.inflight.Load() != 0 {
 		app.commitRaced.Store(true)
 	}
@@ -101,7 +101,7 @@ func (app *seqApp) commit(txs []types.Tx) {
 	app.check = map[string]uint64{}
 }
 
-func setupSeqPool(t testing.TB, app *seqApp, mutate func(*config.MempoolConfig)) *TxPool {
+func asyncSetupSeqPool(t testing.TB, app *asyncSeqApp, mutate func(*config.MempoolConfig)) *TxPool {
 	t.Helper()
 	cfg := config.TestMempoolConfig()
 	cfg.DisableAsyncRecheck = false
@@ -116,7 +116,7 @@ func setupSeqPool(t testing.TB, app *seqApp, mutate func(*config.MempoolConfig))
 }
 
 // commitBlock does what BlockExecutor.Commit does: lock, ABCI Commit, Update.
-func commitBlock(t testing.TB, txmp *TxPool, app *seqApp, height int64, txs []types.Tx) {
+func commitBlock(t testing.TB, txmp *TxPool, app *asyncSeqApp, height int64, txs []types.Tx) {
 	t.Helper()
 	txmp.Lock()
 	require.NoError(t, txmp.FlushAppConn())
@@ -131,7 +131,7 @@ func commitBlock(t testing.TB, txmp *TxPool, app *seqApp, height int64, txs []ty
 func addSeqTxs(t testing.TB, txmp *TxPool, signer string, from, to uint64) {
 	t.Helper()
 	for s := from; s < to; s++ {
-		require.NoError(t, txmp.CheckTx(seqTx(signer, s), nil, mempool.TxInfo{}))
+		require.NoError(t, txmp.CheckTx(asyncSeqTx(signer, s), nil, mempool.TxInfo{}))
 	}
 }
 
@@ -154,12 +154,12 @@ func drain(ch <-chan struct{}) {
 // The commit path returns with committed txs removed while the pass is still
 // running, and reaping neither waits for the pass nor returns a committed tx.
 func TestAsyncRecheck_CommittedTxNeverReaped(t *testing.T) {
-	app := newSeqApp()
-	txmp := setupSeqPool(t, app, nil)
+	app := newAsyncSeqApp()
+	txmp := asyncSetupSeqPool(t, app, nil)
 	addSeqTxs(t, txmp, "a", 0, 5)
 
 	app.recheckGate = make(chan struct{})
-	commitBlock(t, txmp, app, 1, []types.Tx{seqTx("a", 0), seqTx("a", 1)})
+	commitBlock(t, txmp, app, 1, []types.Tx{asyncSeqTx("a", 0), asyncSeqTx("a", 1)})
 
 	require.Equal(t, 3, txmp.Size())
 	reaped := make(chan []*types.CachedTx)
@@ -183,15 +183,15 @@ func TestAsyncRecheck_CommittedTxNeverReaped(t *testing.T) {
 // A new tx is not checked until the pass has replayed the pending txs, so its
 // sequence is checked against the rebuilt check state.
 func TestAsyncRecheck_AdmissionWaitsForPass(t *testing.T) {
-	app := newSeqApp()
-	txmp := setupSeqPool(t, app, nil)
+	app := newAsyncSeqApp()
+	txmp := asyncSetupSeqPool(t, app, nil)
 	addSeqTxs(t, txmp, "a", 0, 3)
 
 	app.recheckGate = make(chan struct{})
-	commitBlock(t, txmp, app, 1, []types.Tx{seqTx("a", 0)})
+	commitBlock(t, txmp, app, 1, []types.Tx{asyncSeqTx("a", 0)})
 
 	added := make(chan error, 1)
-	go func() { added <- txmp.CheckTx(seqTx("a", 3), nil, mempool.TxInfo{}) }()
+	go func() { added <- txmp.CheckTx(asyncSeqTx("a", 3), nil, mempool.TxInfo{}) }()
 	select {
 	case err := <-added:
 		t.Fatalf("admission did not wait for the recheck pass: %v", err)
@@ -200,21 +200,21 @@ func TestAsyncRecheck_AdmissionWaitsForPass(t *testing.T) {
 	close(app.recheckGate)
 	require.NoError(t, <-added)
 	require.Equal(t, 3, txmp.Size())
-	require.True(t, txmp.Has(seqTx("a", 3).Key()), "tx rejected: checked against a half-rebuilt state")
+	require.True(t, txmp.Has(asyncSeqTx("a", 3).Key()), "tx rejected: checked against a half-rebuilt state")
 }
 
 // The next commit waits for the running pass: no CheckTx races ABCI Commit.
 func TestAsyncRecheck_NextCommitWaitsForPass(t *testing.T) {
-	app := newSeqApp()
-	txmp := setupSeqPool(t, app, nil)
+	app := newAsyncSeqApp()
+	txmp := asyncSetupSeqPool(t, app, nil)
 	addSeqTxs(t, txmp, "a", 0, 4)
 
 	app.recheckGate = make(chan struct{})
-	commitBlock(t, txmp, app, 1, []types.Tx{seqTx("a", 0)})
+	commitBlock(t, txmp, app, 1, []types.Tx{asyncSeqTx("a", 0)})
 
 	committed := make(chan struct{})
 	go func() {
-		commitBlock(t, txmp, app, 2, []types.Tx{seqTx("a", 1)})
+		commitBlock(t, txmp, app, 2, []types.Tx{asyncSeqTx("a", 1)})
 		close(committed)
 	}()
 	// Release the first pass one tx at a time; the next commit must not run before it ends.
@@ -237,15 +237,15 @@ func TestAsyncRecheck_NextCommitWaitsForPass(t *testing.T) {
 // A commit that had to wait for the previous pass rechecks synchronously, so
 // admission keeps the next interval; the following commit is async again.
 func TestAsyncRecheck_LatePassFallsBackToSync(t *testing.T) {
-	app := newSeqApp()
-	txmp := setupSeqPool(t, app, nil)
+	app := newAsyncSeqApp()
+	txmp := asyncSetupSeqPool(t, app, nil)
 	addSeqTxs(t, txmp, "a", 0, 6)
 
 	app.recheckGate = make(chan struct{})
-	commitBlock(t, txmp, app, 1, []types.Tx{seqTx("a", 0)}) // async pass over 5 txs
+	commitBlock(t, txmp, app, 1, []types.Tx{asyncSeqTx("a", 0)}) // async pass over 5 txs
 	committed := make(chan struct{})
 	go func() {
-		commitBlock(t, txmp, app, 2, []types.Tx{seqTx("a", 1)})
+		commitBlock(t, txmp, app, 2, []types.Tx{asyncSeqTx("a", 1)})
 		close(committed)
 	}()
 	time.Sleep(50 * time.Millisecond) // let the commit queue on the lock
@@ -264,7 +264,7 @@ func TestAsyncRecheck_LatePassFallsBackToSync(t *testing.T) {
 	require.True(t, txmp.mtx.TryLock(), "late commit left a background pass holding the lock")
 	txmp.mtx.Unlock()
 
-	commitBlock(t, txmp, app, 3, []types.Tx{seqTx("a", 2)}) // async again: returns with the pass gated
+	commitBlock(t, txmp, app, 3, []types.Tx{asyncSeqTx("a", 2)}) // async again: returns with the pass gated
 	require.False(t, txmp.mtx.TryLock())
 	close(app.recheckGate)
 	waitForPass(txmp)
@@ -274,10 +274,10 @@ func TestAsyncRecheck_LatePassFallsBackToSync(t *testing.T) {
 
 // A panic in the synchronous part still releases the lock.
 func TestAsyncRecheck_PanicReleasesLock(t *testing.T) {
-	txmp := setupSeqPool(t, newSeqApp(), nil)
+	txmp := asyncSetupSeqPool(t, newAsyncSeqApp(), nil)
 	txmp.Lock()
 	require.Panics(t, func() {
-		_ = txmp.UpdateAsyncRecheck(1, []*types.CachedTx{seqTx("a", 0).ToCachedTx()}, nil, nil, nil, txmp.Unlock)
+		_ = txmp.UpdateAsyncRecheck(1, []*types.CachedTx{asyncSeqTx("a", 0).ToCachedTx()}, nil, nil, nil, txmp.Unlock)
 	})
 	require.True(t, txmp.mtx.TryLock())
 	txmp.mtx.Unlock()
@@ -285,15 +285,15 @@ func TestAsyncRecheck_PanicReleasesLock(t *testing.T) {
 
 // The height signal and txs-available notification fire after the pass.
 func TestAsyncRecheck_SignalsAfterPass(t *testing.T) {
-	app := newSeqApp()
-	txmp := setupSeqPool(t, app, nil)
+	app := newAsyncSeqApp()
+	txmp := asyncSetupSeqPool(t, app, nil)
 	txmp.EnableTxsAvailable()
 	addSeqTxs(t, txmp, "a", 0, 3)
 	drain(txmp.HeightSignal())
 	drain(txmp.TxsAvailable())
 
 	app.recheckGate = make(chan struct{})
-	commitBlock(t, txmp, app, 1, []types.Tx{seqTx("a", 0)})
+	commitBlock(t, txmp, app, 1, []types.Tx{asyncSeqTx("a", 0)})
 	select {
 	case <-txmp.HeightSignal():
 		t.Fatal("height signal fired before the pass")
@@ -313,9 +313,9 @@ func TestAsyncRecheck_SignalsAfterPass(t *testing.T) {
 // Back-to-back commits (a pass longer than the interval): passes never overlap
 // and each commit is followed by exactly one pass over the whole pool.
 func TestAsyncRecheck_PassesNeverPileUp(t *testing.T) {
-	app := newSeqApp()
+	app := newAsyncSeqApp()
 	app.recheckDelay = time.Millisecond
-	txmp := setupSeqPool(t, app, nil)
+	txmp := asyncSetupSeqPool(t, app, nil)
 	const signers, perSigner, heights = 20, 10, 5
 	for s := 0; s < signers; s++ {
 		addSeqTxs(t, txmp, fmt.Sprintf("s%02d", s), 0, perSigner)
@@ -326,7 +326,7 @@ func TestAsyncRecheck_PassesNeverPileUp(t *testing.T) {
 	for h := 1; h <= heights; h++ {
 		var block []types.Tx
 		for s := 0; s < signers; s++ {
-			block = append(block, seqTx(fmt.Sprintf("s%02d", s), uint64(h-1)))
+			block = append(block, asyncSeqTx(fmt.Sprintf("s%02d", s), uint64(h-1)))
 		}
 		commitBlock(t, txmp, app, int64(h), block)
 		pool -= signers
@@ -351,8 +351,8 @@ func TestAsyncRecheck_SwitchesOffStaySynchronous(t *testing.T) {
 		{"recheck off", false, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			app := newSeqApp()
-			txmp := setupSeqPool(t, app, func(c *config.MempoolConfig) {
+			app := newAsyncSeqApp()
+			txmp := asyncSetupSeqPool(t, app, func(c *config.MempoolConfig) {
 				c.DisableAsyncRecheck = tc.disableAsync
 				c.Recheck = tc.recheck
 			})
@@ -363,8 +363,8 @@ func TestAsyncRecheck_SwitchesOffStaySynchronous(t *testing.T) {
 
 			var unlocked atomic.Bool
 			txmp.Lock()
-			app.commit([]types.Tx{seqTx("a", 0)})
-			require.NoError(t, txmp.UpdateAsyncRecheck(1, []*types.CachedTx{seqTx("a", 0).ToCachedTx()},
+			app.commit([]types.Tx{asyncSeqTx("a", 0)})
+			require.NoError(t, txmp.UpdateAsyncRecheck(1, []*types.CachedTx{asyncSeqTx("a", 0).ToCachedTx()},
 				abciResponses(1, abci.CodeTypeOK), nil, nil, func() { unlocked.Store(true); txmp.Unlock() }))
 			require.True(t, unlocked.Load())
 			require.Equal(t, tc.wantRechecks, app.rechecks.Load())
@@ -377,9 +377,9 @@ func TestAsyncRecheck_SwitchesOffStaySynchronous(t *testing.T) {
 // Race test: commits, recheck passes, admission, reaping and sequence queries
 // run concurrently; every committed tx must be gone from the pool at once.
 func TestAsyncRecheck_Race(t *testing.T) {
-	app := newSeqApp()
+	app := newAsyncSeqApp()
 	app.recheckDelay = 50 * time.Microsecond
-	txmp := setupSeqPool(t, app, nil)
+	txmp := asyncSetupSeqPool(t, app, nil)
 	query, err := proxy.NewConnSyncLocalClientCreator(app).NewABCIClient()
 	require.NoError(t, err)
 	require.NoError(t, query.Start())
@@ -401,7 +401,7 @@ func TestAsyncRecheck_Race(t *testing.T) {
 				}
 				res, err := query.QuerySequence(context.Background(), &abci.RequestQuerySequence{Signer: []byte(signer)})
 				require.NoError(t, err)
-				_ = txmp.CheckTx(seqTx(signer, res.Sequence), nil, mempool.TxInfo{})
+				_ = txmp.CheckTx(asyncSeqTx(signer, res.Sequence), nil, mempool.TxInfo{})
 				time.Sleep(200 * time.Microsecond)
 			}
 		}()
