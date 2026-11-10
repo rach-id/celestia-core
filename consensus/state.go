@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cometbft/cometbft/libs/benchstep"
 	"github.com/cometbft/cometbft/privval"
 
 	proptypes "github.com/cometbft/cometbft/consensus/propagation/types"
@@ -1487,7 +1488,9 @@ func (cs *State) defaultDecideProposal(height int64, round int32) {
 	} else {
 		// Create a new proposal block from state/txs from the mempool.
 		var err error
+		tCreate := time.Now()
 		block, blockParts, err = cs.createProposalBlock(context.TODO())
+		benchstep.Since(height, "propose_create", tCreate, 0)
 		if err != nil {
 			cs.Logger.Error("unable to create proposal block", "error", err)
 			return
@@ -1682,7 +1685,9 @@ func (cs *State) defaultDoPrevote(height int64, round int32) {
 	proposalBlock, initialHeight := cs.rs.ProposalBlock, cs.state.InitialHeight
 	schema.WriteABCI(cs.traceClient, schema.ProcessProposalStart, height, round)
 	cs.unlockAll()
+	tPP := time.Now()
 	isAppValid, err := cs.blockExec.ProcessProposal(proposalBlock, initialHeight)
+	benchstep.Since(height, "process_proposal", tPP, len(proposalBlock.Txs))
 	if err != nil {
 		cs.lockAll()
 		panic(fmt.Sprintf(
@@ -2053,6 +2058,7 @@ func (cs *State) tryFinalizeCommit(height int64) {
 
 // Increment height and goto cstypes.RoundStepNewHeight
 func (cs *State) finalizeCommit(height int64) {
+	defer benchstep.Since(height, "finalize_commit", time.Now(), 0)
 	logger := cs.Logger.With("height", height)
 
 	if cs.rs.Height != height || cs.rs.Step != cstypes.RoundStepCommit {
@@ -2101,11 +2107,13 @@ func (cs *State) finalizeCommit(height int64) {
 		seenExtendedCommit := cs.rs.Votes.Precommits(cs.rs.CommitRound).MakeExtendedCommit(cs.state.ConsensusParams.ABCI)
 		seenCommit = seenExtendedCommit.ToCommit()
 		cs.unlockAll()
+		tSave := time.Now()
 		if cs.state.ConsensusParams.ABCI.VoteExtensionsEnabled(block.Height) {
 			cs.blockStore.SaveBlockWithExtendedCommit(block, blockParts, seenExtendedCommit)
 		} else {
 			cs.blockStore.SaveBlock(block, blockParts, seenExtendedCommit.ToCommit())
 		}
+		benchstep.Since(height, "save_block", tSave, int(blockParts.ByteSize()))
 		cs.lockAll()
 	} else {
 		// Happens during replay if we already saved the block but didn't commit
@@ -2128,7 +2136,10 @@ func (cs *State) finalizeCommit(height int64) {
 	// successfully call ApplyBlock (ie. later here, or in Handshake after
 	// restart).
 	endMsg := EndHeightMessage{height}
-	if err := cs.wal.WriteSync(endMsg); err != nil { // NOTE: fsync
+	tWAL := time.Now()
+	walErr := cs.wal.WriteSync(endMsg)
+	benchstep.Since(height, "wal_endheight", tWAL, 0)
+	if err := walErr; err != nil { // NOTE: fsync
 		panic(fmt.Sprintf(
 			"failed to write %v msg to consensus WAL due to %v; check your file system and restart the node",
 			endMsg, err,
@@ -2146,6 +2157,7 @@ func (cs *State) finalizeCommit(height int64) {
 	// We use apply verified block here because we have verified the block in this function already.
 	// NOTE The block.AppHash won't reflect these txs until the next block.
 	cs.unlockAll()
+	tApply := time.Now()
 	stateCopy, err := cs.blockExec.ApplyVerifiedBlock(
 		stateCopy,
 		types.BlockID{
@@ -2155,6 +2167,7 @@ func (cs *State) finalizeCommit(height int64) {
 		block,
 		seenCommit,
 	)
+	benchstep.Since(height, "apply", tApply, len(block.Txs))
 	cs.lockAll()
 	if err != nil {
 		panic(fmt.Sprintf("failed to apply block; error %v", err))

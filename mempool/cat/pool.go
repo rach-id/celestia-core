@@ -10,6 +10,7 @@ import (
 
 	abci "github.com/cometbft/cometbft/abci/types"
 	"github.com/cometbft/cometbft/config"
+	"github.com/cometbft/cometbft/libs/benchstep"
 	"github.com/cometbft/cometbft/libs/log"
 	"github.com/cometbft/cometbft/libs/trace"
 	"github.com/cometbft/cometbft/libs/trace/schema"
@@ -767,6 +768,8 @@ func (txmp *TxPool) recheckTransactions() {
 	// This avoids holding the store lock during the CheckTx calls which could
 	// cause a deadlock when handleRecheckResult tries to modify the store.
 	wtxs := txmp.store.getOrderedTxs()
+	tRecheck := time.Now()
+	defer func() { benchstep.Since(txmp.height, "recheck", tRecheck, len(wtxs)) }()
 
 	// Issue CheckTx calls for each remaining transaction, and when all the
 	// rechecks are complete signal watchers that transactions may be available.

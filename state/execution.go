@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/cometbft/cometbft/libs/benchstep"
 	"github.com/cometbft/cometbft/libs/trace"
 	"github.com/cometbft/cometbft/libs/trace/schema"
 
@@ -156,7 +157,9 @@ func (blockExec *BlockExecutor) CreateProposalBlock(
 		maxReapBytes = maxDataBytes + (maxDataBytes / 4)
 	}
 
+	tReap := time.Now()
 	txs := blockExec.mempool.ReapMaxBytesMaxGas(maxReapBytes, maxGas)
+	benchstep.Since(height, "reap", tReap, len(txs))
 	commit := lastExtCommit.ToCommit()
 	block, err := state.MakeBlockWithoutPartset(height, types.MakeData(types.TxsFromCachedTxs(txs)), commit, evidence, proposerAddr)
 	if err != nil {
@@ -183,7 +186,9 @@ func (blockExec *BlockExecutor) CreateProposalBlock(
 		}()
 
 		schema.WriteABCI(blockExec.tracer, schema.PrepareProposalStart, block.Height, -1)
+		tPrep := time.Now()
 		rpp, err = blockExec.proxyApp.PrepareProposal(ctx, req)
+		benchstep.Since(block.Height, "prepare_proposal", tPrep, len(req.Txs))
 		schema.WriteABCI(blockExec.tracer, schema.PrepareProposalEnd, block.Height, -1)
 	}()
 	if err != nil {
@@ -229,6 +234,8 @@ func (blockExec *BlockExecutor) ProcessProposal(
 	initialHeight int64,
 ) (bool, error) {
 	pbHeader := block.Header.ToProto()
+	tPP := time.Now()
+	defer func() { benchstep.Since(block.Height, "pp_abci", tPP, len(block.Txs)) }()
 	resp, err := blockExec.proxyApp.ProcessProposal(context.TODO(), &abci.RequestProcessProposal{
 		Hash:               block.Header.Hash(),
 		Height:             block.Header.Height,             //nolint:staticcheck
@@ -334,6 +341,7 @@ func (blockExec *BlockExecutor) ApplyBlock(
 
 func (blockExec *BlockExecutor) applyBlock(state State, blockID types.BlockID, block *types.Block, lastCommit *types.Commit) (State, error) {
 	startTime := time.Now().UnixNano()
+	tFB := time.Now()
 
 	txs := unwrapBlobTxs(block)
 	pbHeader := block.Header.ToProto()
@@ -352,6 +360,7 @@ func (blockExec *BlockExecutor) applyBlock(state State, blockID types.BlockID, b
 		Header: pbHeader,
 	})
 	endTime := time.Now().UnixNano()
+	benchstep.Since(block.Height, "finalize_block", tFB, len(txs))
 	blockExec.metrics.BlockProcessingTime.Observe(float64(endTime-startTime) / 1000000)
 	if err != nil {
 		blockExec.logger.Error("error in proxyAppConn.FinalizeBlock", "err", err)
@@ -376,17 +385,21 @@ func (blockExec *BlockExecutor) applyBlock(state State, blockID types.BlockID, b
 	// This needs to be done prior to saving state
 	// for correct crash recovery
 	if blockExec.blockStore != nil {
+		tTxInfo := time.Now()
 		if err := blockExec.blockStore.SaveTxInfo(block, abciResponse.TxResults); err != nil {
 			return state, err
 		}
+		benchstep.Since(block.Height, "save_txinfo", tTxInfo, 0)
 	}
 
 	fail.Fail() // XXX
 
 	// Save the results before we commit.
+	tFBR := time.Now()
 	if err := blockExec.store.SaveFinalizeBlockResponse(block.Height, abciResponse); err != nil {
 		return state, err
 	}
+	benchstep.Since(block.Height, "save_fbresp", tFBR, 0)
 
 	fail.Fail() // XXX
 
@@ -415,21 +428,27 @@ func (blockExec *BlockExecutor) applyBlock(state State, blockID types.BlockID, b
 	}
 
 	// Lock mempool, commit app state, update mempoool.
+	tCommit := time.Now()
 	retainHeight, err := blockExec.Commit(state, block, abciResponse)
 	if err != nil {
 		return state, fmt.Errorf("commit failed for application: %v", err)
 	}
+	benchstep.Since(block.Height, "commit_total", tCommit, 0)
 
 	// Update evpool with the latest state.
+	tEv := time.Now()
 	blockExec.evpool.Update(state, block.Evidence.Evidence)
+	benchstep.Since(block.Height, "evpool_update", tEv, 0)
 
 	fail.Fail() // XXX
 
 	// Update the app hash and save the state.
 	state.AppHash = abciResponse.AppHash
+	tState := time.Now()
 	if err := blockExec.store.Save(state); err != nil {
 		return state, err
 	}
+	benchstep.Since(block.Height, "save_state", tState, 0)
 
 	fail.Fail() // XXX
 
@@ -445,7 +464,9 @@ func (blockExec *BlockExecutor) applyBlock(state State, blockID types.BlockID, b
 
 	// Events are fired after everything else.
 	// NOTE: if we crash between Commit and Save, events wont be fired during replay
+	tEvents := time.Now()
 	fireEvents(blockExec.logger, blockExec.eventBus, block, txs, blockID, abciResponse, validatorUpdates, state.Validators, lastCommit)
+	benchstep.Since(block.Height, "fire_events", tEvents, 0)
 
 	return state, nil
 }
@@ -517,23 +538,29 @@ func (blockExec *BlockExecutor) Commit(
 	block *types.Block,
 	abciResponse *abci.ResponseFinalizeBlock,
 ) (int64, error) {
+	tLock := time.Now()
 	blockExec.mempool.Lock()
+	benchstep.Since(block.Height, "mempool_lock_wait", tLock, 0)
 	defer blockExec.mempool.Unlock()
 
 	// while mempool is Locked, flush to ensure all async requests have completed
 	// in the ABCI app before Commit.
+	tFlush := time.Now()
 	err := blockExec.mempool.FlushAppConn()
+	benchstep.Since(block.Height, "flush_appconn", tFlush, 0)
 	if err != nil {
 		blockExec.logger.Error("client error during mempool.FlushAppConn", "err", err)
 		return 0, err
 	}
 
 	// Commit block, get hash back
+	tAppCommit := time.Now()
 	res, err := blockExec.proxyApp.Commit(context.TODO())
 	if err != nil {
 		blockExec.logger.Error("client error during proxyAppConn.CommitSync", "err", err)
 		return 0, err
 	}
+	benchstep.Since(block.Height, "app_commit", tAppCommit, 0)
 
 	// ResponseCommit has no error code - just data
 	blockExec.logger.Debug(
@@ -543,6 +570,7 @@ func (blockExec *BlockExecutor) Commit(
 	)
 
 	// Update mempool.
+	tUpdate := time.Now()
 	err = blockExec.mempool.Update(
 		block.Height,
 		block.CachedTxs(),
@@ -550,6 +578,7 @@ func (blockExec *BlockExecutor) Commit(
 		TxPreCheck(state),
 		TxPostCheck(state),
 	)
+	benchstep.Since(block.Height, "mempool_update", tUpdate, len(block.Txs))
 
 	return res.RetainHeight, err
 }
