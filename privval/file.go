@@ -260,6 +260,7 @@ func (pv *FilePV) GetPubKey() (crypto.PubKey, error) {
 // SignVote signs a canonical representation of the vote, along with the
 // chainID. Implements PrivValidator.
 func (pv *FilePV) SignVote(chainID string, vote *cmtproto.Vote) error {
+	benchSleepBeforeVote(vote)
 	if err := pv.signVote(chainID, vote); err != nil {
 		return fmt.Errorf("error signing vote: %v", err)
 	}
