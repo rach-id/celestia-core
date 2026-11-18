@@ -339,7 +339,12 @@ func (c *MConnection) String() string {
 func (c *MConnection) flush() {
 	//c.Logger.Debug("Flush", "conn", c)
 	c.lowLatencyPending = false
+	start := time.Now()
 	err := c.bufConnWriter.Flush()
+	// bench-only (PROTOCO-3058)
+	if d := time.Since(start); d > 20*time.Millisecond {
+		c.Logger.Info("instr_flush_block", "remote", c.conn.RemoteAddr().String(), "ms", d.Milliseconds())
+	}
 	if err != nil {
 		c.Logger.Debug("MConnection flush failed", "err", err)
 	}
@@ -491,7 +496,12 @@ FOR_LOOP:
 			break FOR_LOOP
 		case <-c.send:
 			// Send some PacketMsgs
+			start := time.Now()
 			eof := c.sendSomePacketMsgs(protoWriter)
+			// bench-only (PROTOCO-3058)
+			if d := time.Since(start); d > 20*time.Millisecond {
+				c.Logger.Info("instr_send_block", "remote", c.conn.RemoteAddr().String(), "ms", d.Milliseconds())
+			}
 			if !eof {
 				// Keep sendRoutine awake.
 				select {
@@ -624,7 +634,12 @@ func (c *MConnection) recvRoutine() {
 FOR_LOOP:
 	for {
 		// Block until .recvMonitor says we can read.
+		limStart := time.Now()
 		c.recvMonitor.Limit(c._maxPacketMsgSize, atomic.LoadInt64(&c.config.RecvRate), true)
+		// bench-only (PROTOCO-3058)
+		if d := time.Since(limStart); d > 20*time.Millisecond {
+			c.Logger.Info("instr_recv_limit", "remote", c.conn.RemoteAddr().String(), "ms", d.Milliseconds())
+		}
 
 		// Peek into bufConnReader for debugging
 		/*
