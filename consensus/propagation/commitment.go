@@ -324,7 +324,7 @@ func (blockProp *Reactor) recoverPartsFromMempool(cb *proptypes.CompactBlock) {
 		return
 	}
 
-	recoveredCount := 0
+	recovered := make([]*types.Part, 0, len(parts))
 	haves := proptypes.HaveParts{
 		Height: cb.Proposal.Height,
 		Round:  cb.Proposal.Round,
@@ -347,22 +347,13 @@ func (blockProp *Reactor) recoverPartsFromMempool(cb *proptypes.CompactBlock) {
 			continue
 		}
 
-		select {
-		case <-blockProp.ctx.Done():
-			return
-		case blockProp.partChan <- types.PartInfo{
-			Part:   p,
-			Height: cb.Proposal.Height,
-			Round:  cb.Proposal.Round,
-		}:
-		}
-
-		recoveredCount++
-
+		recovered = append(recovered, p)
 		haves.Parts = append(haves.Parts, proptypes.PartMetaData{Index: p.Index, Hash: p.Proof.LeafHash})
 	}
+	// a peer may have asked for one of these parts after a request advertised it.
+	blockProp.publishLocalParts(cb.Proposal.Height, cb.Proposal.Round, recovered)
 
-	schema.WriteMempoolRecoveredParts(blockProp.traceClient, cb.Proposal.Height, cb.Proposal.Round, recoveredCount, time.Since(startTime).Nanoseconds())
+	schema.WriteMempoolRecoveredParts(blockProp.traceClient, cb.Proposal.Height, cb.Proposal.Round, len(recovered), time.Since(startTime).Nanoseconds())
 
 	if len(haves.Parts) > 0 {
 		blockProp.broadcastHaves(&haves, blockProp.self, int(partSet.Total()))
