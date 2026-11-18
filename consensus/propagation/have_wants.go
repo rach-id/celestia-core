@@ -41,7 +41,7 @@ func (blockProp *Reactor) handleHaves(peer p2p.ID, haves *proptypes.HaveParts) {
 
 	cb, parts, fullReqs, has := blockProp.getAllState(height, round, false)
 	if !has {
-		blockProp.Logger.Debug("received have part for unknown proposal", "peer", peer, "height", height, "round", round)
+		instrNote(blockProp, height, round, "have_nostate", "from=%s n=%d min=%d", peer, len(haves.Parts), minIndex(haves))
 		// blockProp.Switch.StopPeerForError(blockProp.getPeer(peer).peer, errors.New("received part for unknown proposal"))
 		return
 	}
@@ -101,6 +101,7 @@ func (blockProp *Reactor) handleHaves(peer p2p.ID, haves *proptypes.HaveParts) {
 			}:
 				p.RequestsReady()
 			default:
+				instrNote(blockProp, height, round, "have_chanfull", "from=%s idx=%d", peer, index)
 			}
 		}
 	}
@@ -180,9 +181,13 @@ func (blockProp *Reactor) requestFromPeer(ps *PeerState) {
 					}
 				}
 
+				edge := isEdge(parts, have.index)
 				missingPartsCount := countRemainingParts(int(parts.Total()), len(parts.BitArray().GetTrueIndices()))
 				if missingPartsCount == 0 {
 					// we can ignore this have in this case
+					if edge {
+						instrNote(blockProp, have.height, have.round, "req_skip", "peer=%s idx=%d why=nomissing", ps.peer.ID(), have.index)
+					}
 					continue
 				}
 
@@ -193,6 +198,9 @@ func (blockProp *Reactor) requestFromPeer(ps *PeerState) {
 
 				// don't request a part that has already hit the request limit
 				if fullReqs.GetIndex(int(have.index)) {
+					if edge {
+						instrNote(blockProp, have.height, have.round, "req_skip", "peer=%s idx=%d why=fullreqs", ps.peer.ID(), have.index)
+					}
 					continue
 				}
 
@@ -201,6 +209,9 @@ func (blockProp *Reactor) requestFromPeer(ps *PeerState) {
 				reqs := blockProp.countRequests(have.height, have.round, int(have.index))
 				if len(reqs) >= reqLimit {
 					fullReqs.SetIndex(int(have.index), true)
+					if edge {
+						instrNote(blockProp, have.height, have.round, "req_skip", "peer=%s idx=%d why=reqlimit by=%v", ps.peer.ID(), have.index, reqs)
+					}
 					continue
 				}
 
@@ -256,6 +267,8 @@ func (blockProp *Reactor) sendWantsThenBroadcastHaves(ps *PeerState, wants *prop
 	if err != nil {
 		return err
 	}
+	idx := wants.Parts.GetTrueIndices()
+	instrNote(blockProp, wants.Height, wants.Round, "want_tx", "to=%s mpc=%d n=%d edges=%v", ps.peer.ID(), wants.MissingPartsCount, len(idx), edgesIn(wants.Parts))
 	blockProp.sendWant(ps, wants)
 	blockProp.broadcastHaves(have, ps.peer.ID(), wants.Parts.Size())
 	return nil
@@ -412,9 +425,11 @@ func (blockProp *Reactor) handleWants(peer p2p.ID, wants *proptypes.WantParts) {
 	// store are served without it, as they may name any round.
 	tracked := blockProp.hasCachedRound(height, round)
 	untrackedRemaining := int(wants.MissingPartsCount)
+	prevRemaining := p.GetRemainingRequests(height, round)
 	if tracked {
 		p.SetRemainingRequests(height, round, untrackedRemaining)
 	}
+	sentEdges := []int{}
 	for _, partIndex := range canSend.GetTrueIndices() {
 		if tracked && p.GetRemainingRequests(height, round) <= 0 || !tracked && untrackedRemaining <= 0 {
 			break
@@ -445,6 +460,9 @@ func (blockProp *Reactor) handleWants(peer p2p.ID, wants *proptypes.WantParts) {
 		} else {
 			untrackedRemaining--
 		}
+		if isEdge(parts, uint32(partIndex)) {
+			sentEdges = append(sentEdges, partIndex)
+		}
 		// p.SetHave(height, round, int(partIndex))
 		schema.WriteBlockPart(blockProp.traceClient, height, round, part.Index, wants.Prove, string(peer), schema.Upload)
 	}
@@ -453,6 +471,11 @@ func (blockProp *Reactor) handleWants(peer p2p.ID, wants *proptypes.WantParts) {
 	stillMissing := wants.Parts.Sub(canSend)
 	if tracked && !stillMissing.IsEmpty() {
 		p.AddWants(height, round, stillMissing)
+	}
+	if !wants.Prove {
+		instrNote(blockProp, height, round, "want_rx", "from=%s mpc=%d prev=%d left=%d n=%d held=%d edges=%v held_edges=%v sent_edges=%v parked_edges=%v tracked=%v",
+			peer, wants.MissingPartsCount, prevRemaining, p.GetRemainingRequests(height, round), len(wants.Parts.GetTrueIndices()), len(canSend.GetTrueIndices()),
+			edgesIn(wants.Parts), edgesIn(canSend), sentEdges, edgesIn(stillMissing), tracked)
 	}
 }
 
@@ -538,7 +561,7 @@ func (blockProp *Reactor) handleRecoveryPart(peer p2p.ID, part *proptypes.Recove
 	// Only an incomplete cached entry can use a part, so never read the store here.
 	cb, parts, has, _ := blockProp.getCachedState(part.Height, part.Round, part.Proof != nil)
 	if !has {
-		blockProp.Logger.Debug("received part for unknown proposal", "peer", peer, "height", part.Height, "round", part.Round)
+		instrNote(blockProp, part.Height, part.Round, "part_nostate", "from=%s idx=%d", peer, part.Index)
 		// blockProp.Switch.StopPeerForError(p.peer, errors.New("received recovery part for unknown proposal"))
 		return
 	}
@@ -677,6 +700,7 @@ func (blockProp *Reactor) clearWants(part *proptypes.RecoveryPart, proof merkle.
 	for _, peer := range blockProp.getPeers() {
 		if peer.WantsPart(part.Height, part.Round, part.Index) {
 			if peer.GetRemainingRequests(part.Height, part.Round) <= 0 {
+				instrNote(blockProp, part.Height, part.Round, "clear_skip", "peer=%s idx=%d why=budget", peer.peer.ID(), part.Index)
 				continue
 			}
 			e := p2p.Envelope{
@@ -696,6 +720,7 @@ func (blockProp *Reactor) clearWants(part *proptypes.RecoveryPart, proof merkle.
 			}
 
 			if !peer.peer.TrySend(e) {
+				instrNote(blockProp, part.Height, part.Round, "clear_skip", "peer=%s idx=%d why=sendfail", peer.peer.ID(), part.Index)
 				blockProp.Logger.Error("failed to send part", "peer", peer.peer.ID(), "height", part.Height, "round", part.Round, "part", part.Index)
 				continue
 			}
