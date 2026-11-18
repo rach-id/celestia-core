@@ -20,7 +20,7 @@ import (
 
 //go:generate ../scripts/mockery_generate.sh Peer
 
-const metricsTickerDuration = 10 * time.Second
+const metricsTickerDuration = 250 * time.Millisecond
 
 // Peer is an interface representing a peer connected on a reactor.
 type Peer interface {
@@ -484,11 +484,16 @@ func createMConnection(
 			panic(fmt.Sprintf("Unknown channel %X", chID))
 		}
 
+		start := time.Now()
 		reactor.QueueUnprocessedEnvelope(UnprocessedEnvelope{
 			ChannelID: chID,
 			Src:       p,
 			Message:   msgBytes,
 		})
+		// bench-only (PROTOCO-3058): a blocked hand-off stalls this whole connection.
+		if d := time.Since(start); d > 20*time.Millisecond {
+			schema.WriteNote(p.traceClient, 0, 0, "recv_block", "peer=%s ch=%#x reactor=%s ms=%d len=%d", p.ID(), chID, reactor.String(), d.Milliseconds(), len(msgBytes))
+		}
 	}
 
 	onError := func(r interface{}) {

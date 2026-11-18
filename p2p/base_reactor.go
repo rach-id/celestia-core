@@ -3,6 +3,7 @@ package p2p
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/cometbft/cometbft/libs/trace"
 
@@ -314,11 +315,16 @@ func ProcessorWithReactor(impl Reactor, baseReactor *BaseReactor) ProcessorFunc 
 					res.Src.Metrics().PeerReceiveBytesTotal.With(labels...).Add(logBytesReceived)
 					res.Src.Metrics().MessageReceiveBytesTotal.With(append(labels, "message_type", res.Src.ValueToMetricLabel(msg))...).Add(logBytesReceived)
 					schema.WriteReceivedBytes(res.Src.TraceClient(), string(res.Src.ID()), res.ChannelID, res.BytesReceived)
+					start := time.Now()
 					impl.Receive(Envelope{
 						ChannelID: res.ChannelID,
 						Src:       res.Src,
 						Message:   msg,
 					})
+					// bench-only (PROTOCO-3058): a slow handler backs up this reactor's queue.
+					if d := time.Since(start); d > 20*time.Millisecond {
+						schema.WriteNote(res.Src.TraceClient(), 0, 0, "proc_slow", "reactor=%s ch=%#x peer=%s msg=%T ms=%d queued=%d", impl.String(), res.ChannelID, res.Src.ID(), msg, d.Milliseconds(), len(incoming))
+					}
 
 					return nil
 				}
