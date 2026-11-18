@@ -350,8 +350,14 @@ func (blockProp *Reactor) recoverPartsFromMempool(cb *proptypes.CompactBlock) {
 		recovered = append(recovered, p)
 		haves.Parts = append(haves.Parts, proptypes.PartMetaData{Index: p.Index, Hash: p.Proof.LeafHash})
 	}
-	// a peer may have asked for one of these parts after a request advertised it.
-	blockProp.publishLocalParts(cb.Proposal.Height, cb.Proposal.Round, recovered)
+	// arm C: mempool-rebuilt parts go to consensus only, as on main; no clearWants.
+	for _, p := range recovered {
+		select {
+		case <-blockProp.ctx.Done():
+			return
+		case blockProp.partChan <- types.PartInfo{Part: p, Height: cb.Proposal.Height, Round: cb.Proposal.Round}:
+		}
+	}
 
 	schema.WriteMempoolRecoveredParts(blockProp.traceClient, cb.Proposal.Height, cb.Proposal.Round, len(recovered), time.Since(startTime).Nanoseconds())
 
