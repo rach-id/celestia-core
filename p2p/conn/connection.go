@@ -377,6 +377,16 @@ func (c *MConnection) stopForError(r interface{}) {
 
 // Queues a message to be sent to channel.
 func (c *MConnection) Send(chID byte, msgBytes []byte) bool {
+	return c.queueSend(chID, msgBytes, false)
+}
+
+// SendLazy is Send for a message that never arms the FlushLowLatency timer: it
+// leaves with the next low-latency flush or the flush throttle.
+func (c *MConnection) SendLazy(chID byte, msgBytes []byte) bool {
+	return c.queueSend(chID, msgBytes, true)
+}
+
+func (c *MConnection) queueSend(chID byte, msgBytes []byte, lazy bool) bool {
 	if !c.IsRunning() {
 		return false
 	}
@@ -390,7 +400,7 @@ func (c *MConnection) Send(chID byte, msgBytes []byte) bool {
 		return false
 	}
 
-	success := channel.sendBytes(msgBytes)
+	success := channel.sendBytes(msgBytes, lazy)
 	if success {
 		// Wake up sendRoutine if necessary
 		select {
@@ -406,6 +416,15 @@ func (c *MConnection) Send(chID byte, msgBytes []byte) bool {
 // Queues a message to be sent to channel.
 // Nonblocking, returns true if successful.
 func (c *MConnection) TrySend(chID byte, msgBytes []byte) bool {
+	return c.queueTrySend(chID, msgBytes, false)
+}
+
+// TrySendLazy is TrySend for a message that never arms the FlushLowLatency timer.
+func (c *MConnection) TrySendLazy(chID byte, msgBytes []byte) bool {
+	return c.queueTrySend(chID, msgBytes, true)
+}
+
+func (c *MConnection) queueTrySend(chID byte, msgBytes []byte, lazy bool) bool {
 	if !c.IsRunning() {
 		return false
 	}
@@ -419,7 +438,7 @@ func (c *MConnection) TrySend(chID byte, msgBytes []byte) bool {
 		return false
 	}
 
-	ok = channel.trySendBytes(msgBytes)
+	ok = channel.trySendBytes(msgBytes, lazy)
 	if ok {
 		// Wake up sendRoutine if necessary
 		select {
@@ -578,7 +597,7 @@ func (c *MConnection) flushLowLatency() {
 		return
 	}
 	for _, ch := range c.channels {
-		if ch.desc.LowLatency && ch.isSendPending() {
+		if ch.desc.LowLatency && ch.isSendPending() && !ch.sendingLazy {
 			return
 		}
 	}
@@ -615,6 +634,7 @@ func selectChannelToGossipOn(channels []*Channel) *Channel {
 // returns (num_bytes_written, error_occurred).
 func (c *MConnection) sendPacketMsgOnChannel(w protoio.Writer, sendChannel *Channel) (int, bool) {
 	// Make & send a PacketMsg from this channel
+	lazy := sendChannel.sendingLazy
 	n, err := sendChannel.writePacketMsgTo(w)
 	if err != nil {
 		c.Logger.Info("Failed to write PacketMsg", "err", err)
@@ -622,7 +642,7 @@ func (c *MConnection) sendPacketMsgOnChannel(w protoio.Writer, sendChannel *Chan
 		return n, true
 	}
 	// sending is cleared once the last packet of a message is written.
-	if c.lowLatencyTimer != nil && sendChannel.desc.LowLatency && len(sendChannel.sending) == 0 {
+	if c.lowLatencyTimer != nil && sendChannel.desc.LowLatency && !lazy && len(sendChannel.sending) == 0 {
 		c.lowLatencyPending = true
 	}
 	c.flushTimer.Set()
@@ -828,15 +848,22 @@ func (chDesc ChannelDescriptor) FillDefaults() (filled ChannelDescriptor) {
 	return
 }
 
+// queuedMsg is one message in a channel's send queue.
+type queuedMsg struct {
+	bytes []byte
+	lazy  bool
+}
+
 // TODO: lowercase.
 // NOTE: not goroutine-safe.
 type Channel struct {
 	conn          *MConnection
 	desc          ChannelDescriptor
-	sendQueue     chan []byte
+	sendQueue     chan queuedMsg
 	sendQueueSize int32 // atomic.
 	recving       []byte
 	sending       []byte
+	sendingLazy   bool  // sending never arms the FlushLowLatency timer
 	recentlySent  int64 // exponential moving average
 
 	maxPacketMsgPayloadSize int
@@ -852,7 +879,7 @@ func newChannel(conn *MConnection, desc ChannelDescriptor) *Channel {
 	return &Channel{
 		conn:                    conn,
 		desc:                    desc,
-		sendQueue:               make(chan []byte, desc.SendQueueCapacity),
+		sendQueue:               make(chan queuedMsg, desc.SendQueueCapacity),
 		recving:                 make([]byte, 0, desc.RecvBufferCapacity),
 		maxPacketMsgPayloadSize: conn.config.MaxPacketMsgPayloadSize,
 	}
@@ -865,9 +892,9 @@ func (ch *Channel) SetLogger(l log.Logger) {
 // Queues message to send to this channel.
 // Goroutine-safe
 // Times out (and returns false) after defaultSendTimeout
-func (ch *Channel) sendBytes(bytes []byte) bool {
+func (ch *Channel) sendBytes(bytes []byte, lazy bool) bool {
 	select {
-	case ch.sendQueue <- bytes:
+	case ch.sendQueue <- queuedMsg{bytes, lazy}:
 		atomic.AddInt32(&ch.sendQueueSize, 1)
 		return true
 	case <-time.After(defaultSendTimeout):
@@ -878,9 +905,9 @@ func (ch *Channel) sendBytes(bytes []byte) bool {
 // Queues message to send to this channel.
 // Nonblocking, returns true if successful.
 // Goroutine-safe
-func (ch *Channel) trySendBytes(bytes []byte) bool {
+func (ch *Channel) trySendBytes(bytes []byte, lazy bool) bool {
 	select {
-	case ch.sendQueue <- bytes:
+	case ch.sendQueue <- queuedMsg{bytes, lazy}:
 		atomic.AddInt32(&ch.sendQueueSize, 1)
 		return true
 	default:
@@ -907,7 +934,8 @@ func (ch *Channel) isSendPending() bool {
 		if len(ch.sendQueue) == 0 {
 			return false
 		}
-		ch.sending = <-ch.sendQueue
+		m := <-ch.sendQueue
+		ch.sending, ch.sendingLazy = m.bytes, m.lazy
 	}
 	return true
 }
