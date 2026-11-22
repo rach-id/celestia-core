@@ -3,6 +3,7 @@ package consensus
 import (
 	"errors"
 	"fmt"
+	"os"
 	"reflect"
 	"strconv"
 	"sync"
@@ -62,6 +63,12 @@ type Reactor struct {
 
 	// gossipDataEnabled controls whether the gossipDataRoutine should run
 	gossipDataEnabled atomic.Bool
+
+	// Bench knobs (celestia-core#3763), off by default. lazyHasVote sends HasVote
+	// without arming the low-latency flush; skipStaleHasVote drops HasVotes for
+	// past heights, which every receiver ignores (ApplyHasVoteMessage).
+	lazyHasVote      bool
+	skipStaleHasVote bool
 }
 
 type ReactorOption func(*Reactor)
@@ -76,6 +83,9 @@ func NewReactor(consensusState *State, propagator propagation.Propagator, waitSy
 		Metrics:     NopMetrics(),
 		traceClient: trace.NoOpTracer(),
 		propagator:  propagator,
+
+		lazyHasVote:      os.Getenv("CMT_BENCH_LAZY_HASVOTE") == "1",
+		skipStaleHasVote: os.Getenv("CMT_BENCH_HASVOTE_SKIP_STALE") == "1",
 	}
 
 	for _, option := range options {
@@ -602,16 +612,11 @@ func (conR *Reactor) broadcastNewValidBlockMessage(rs *cstypes.RoundState) {
 
 // Broadcasts HasVoteMessage to peers that care.
 func (conR *Reactor) broadcastHasVoteMessage(vote *types.Vote) {
-	msg := &cmtcons.HasVote{
-		Height: vote.Height,
-		Round:  vote.Round,
-		Type:   vote.Type,
-		Index:  vote.ValidatorIndex,
+	e, ok := conR.hasVoteEnvelope(vote)
+	if !ok {
+		return
 	}
-	conR.Switch.Broadcast(p2p.Envelope{
-		ChannelID: StateChannel,
-		Message:   msg,
-	})
+	conR.Switch.Broadcast(e)
 	schema.WriteConsensusState(
 		conR.traceClient,
 		vote.Height,
@@ -643,6 +648,23 @@ func (conR *Reactor) broadcastHasVoteMessage(vote *types.Vote) {
 			}
 		}
 	*/
+}
+
+// hasVoteEnvelope builds the HasVote broadcast for vote; false means skip it.
+func (conR *Reactor) hasVoteEnvelope(vote *types.Vote) (p2p.Envelope, bool) {
+	if conR.skipStaleHasVote && vote.Height < conR.getRoundState().Height {
+		return p2p.Envelope{}, false
+	}
+	return p2p.Envelope{
+		ChannelID: StateChannel,
+		Message: &cmtcons.HasVote{
+			Height: vote.Height,
+			Round:  vote.Round,
+			Type:   vote.Type,
+			Index:  vote.ValidatorIndex,
+		},
+		Lazy: conR.lazyHasVote,
+	}, true
 }
 
 func makeRoundStepMessage(rs *cstypes.RoundState) (nrsMsg *cmtcons.NewRoundStep) {
