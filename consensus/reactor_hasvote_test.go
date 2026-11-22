@@ -44,6 +44,17 @@ func TestHasVoteEnvelope(t *testing.T) {
 		require.True(t, ok)
 	})
 
+	t.Run("bench defaults: lazy on, skip-stale off", func(t *testing.T) {
+		t.Setenv("CMT_BENCH_LAZY_HASVOTE", "")
+		t.Setenv("CMT_BENCH_HASVOTE_SKIP_STALE", "")
+		cs, _ := randState(1)
+		conR := NewReactor(cs, nil, false)
+		require.True(t, conR.lazyHasVote)
+		require.False(t, conR.skipStaleHasVote)
+		t.Setenv("CMT_BENCH_LAZY_HASVOTE", "0")
+		require.False(t, NewReactor(cs, nil, false).lazyHasVote)
+	})
+
 	t.Run("knobs from env", func(t *testing.T) {
 		t.Setenv("CMT_BENCH_LAZY_HASVOTE", "1")
 		t.Setenv("CMT_BENCH_HASVOTE_SKIP_STALE", "1")

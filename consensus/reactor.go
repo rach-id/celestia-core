@@ -64,9 +64,9 @@ type Reactor struct {
 	// gossipDataEnabled controls whether the gossipDataRoutine should run
 	gossipDataEnabled atomic.Bool
 
-	// Bench knobs (celestia-core#3763), off by default. lazyHasVote sends HasVote
-	// without arming the low-latency flush; skipStaleHasVote drops HasVotes for
-	// past heights, which every receiver ignores (ApplyHasVoteMessage).
+	// Bench knobs (celestia-core#3763): lazyHasVote (on unless env =0) sends HasVote
+	// without arming the low-latency flush; skipStaleHasVote (off unless env =1)
+	// drops HasVotes for past heights, which every receiver ignores.
 	lazyHasVote      bool
 	skipStaleHasVote bool
 }
@@ -84,7 +84,7 @@ func NewReactor(consensusState *State, propagator propagation.Propagator, waitSy
 		traceClient: trace.NoOpTracer(),
 		propagator:  propagator,
 
-		lazyHasVote:      os.Getenv("CMT_BENCH_LAZY_HASVOTE") == "1",
+		lazyHasVote:      os.Getenv("CMT_BENCH_LAZY_HASVOTE") != "0",
 		skipStaleHasVote: os.Getenv("CMT_BENCH_HASVOTE_SKIP_STALE") == "1",
 	}
 
@@ -112,6 +112,8 @@ func (conR *Reactor) IsGossipDataEnabled() bool {
 // broadcasted to other peers and starting state if we're not in block sync.
 func (conR *Reactor) OnStart() error {
 	conR.Logger.Info("Reactor ", "waitSync", conR.WaitSync())
+	conR.Logger.Info("bench HasVote knobs", "lazy_hasvote", conR.lazyHasVote,
+		"hasvote_skip_stale", conR.skipStaleHasVote)
 
 	// start routine that computes peer statistics for evaluating peer quality
 	go conR.peerStatsRoutine()
