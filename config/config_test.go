@@ -196,6 +196,8 @@ func TestP2PConfigValidateBasic(t *testing.T) {
 		"MaxNumOutboundPeers",
 		"FlushThrottleTimeout",
 		"FlushLowLatency",
+		"FlushImmediateMinSize",
+		"FlushQuietImmediate",
 		"MaxPacketMsgPayloadSize",
 		"SendRate",
 		"RecvRate",

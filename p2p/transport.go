@@ -622,6 +622,25 @@ func (mt *MultiplexTransport) upgrade(
 		}
 	}
 
+	// Both NodeInfos are exchanged and nothing else is in flight, so both
+	// sides switch at the same frame boundary.
+	if negotiatedFrameVersion(mt.nodeInfo, nodeInfo) >= conn.FrameVersionVariable {
+		if err := secretConn.EnableVariableFrames(); err != nil {
+			return nil, nil, ErrRejected{
+				conn:           c,
+				err:            err,
+				id:             nodeInfo.ID(),
+				isAuthFailure:  true,
+				localNodeID:    string(mt.nodeInfo.ID()),
+				remoteNodeID:   string(nodeInfo.ID()),
+				localAddr:      c.LocalAddr().String(),
+				remoteAddr:     c.RemoteAddr().String(),
+				handshakeStage: "frame-version-switch",
+				traceID:        traceID,
+			}
+		}
+	}
+
 	return secretConn, nodeInfo, nil
 }
 

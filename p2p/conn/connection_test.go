@@ -3,7 +3,9 @@ package conn
 import (
 	"bytes"
 	"encoding/hex"
+	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -999,4 +1001,185 @@ func TestMConnectionSendLazyEndToEnd(t *testing.T) {
 		got = append(got, buf[:n]...)
 	}
 	require.True(t, bytes.Contains(got, []byte("hasvote")), "the lazy message leaves with the vote's flush")
+}
+
+func TestFrameWriter(t *testing.T) {
+	var out bytes.Buffer
+	conn := &sizeRecorder{w: &out}
+	fw := newFrameWriter(conn, 4*dataMaxSize)
+	var in []byte
+	write := func(n int) {
+		p := bytes.Repeat([]byte{byte(len(in))}, n)
+		in = append(in, p...)
+		m, err := fw.Write(p)
+		require.NoError(t, err)
+		require.Equal(t, n, m)
+	}
+
+	write(2500)
+	require.Equal(t, 2500, fw.Buffered())
+	require.NoError(t, fw.FlushWhole(dataMaxSize))
+	require.NoError(t, fw.FlushWhole(dataMaxSize)) // only a partial frame left
+	require.Equal(t, 2500-2*dataMaxSize, fw.Buffered())
+	write(4000) // overflows: fills the buffer and writes all of it, like bufio
+	require.NoError(t, fw.Flush())
+	write(5000) // larger than the buffer while empty: written directly
+	require.Equal(t, []int{2 * dataMaxSize, 4 * dataMaxSize, 356, 5000}, conn.sizes)
+	require.Equal(t, in, out.Bytes())
+
+	failing := newFrameWriter(errWriter{}, 4*dataMaxSize)
+	write = func(n int) { _, _ = failing.Write(make([]byte, n)) }
+	write(10)
+	require.Error(t, failing.Flush())
+	_, err := failing.Write([]byte("x"))
+	require.Error(t, err, "errors are sticky")
+}
+
+type sizeRecorder struct {
+	w     io.Writer
+	sizes []int
+}
+
+func (r *sizeRecorder) Write(b []byte) (int, error) {
+	r.sizes = append(r.sizes, len(b))
+	return r.w.Write(b)
+}
+
+type errWriter struct{}
+
+func (errWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+// recordingConn records the size of every write that reaches the socket.
+type recordingConn struct {
+	net.Conn
+	mtx    sync.Mutex
+	writes []int
+}
+
+func (c *recordingConn) Write(b []byte) (int, error) {
+	c.mtx.Lock()
+	c.writes = append(c.writes, len(b))
+	c.mtx.Unlock()
+	return c.Conn.Write(b)
+}
+
+func (c *recordingConn) sizes() []int {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return append([]int(nil), c.writes...)
+}
+
+// knobLowLatency is long enough that a write within knobWindow can't come from the timer.
+const (
+	knobLowLatency = 500 * time.Millisecond
+	knobWindow     = 200 * time.Millisecond
+)
+
+// newFlushKnobTestMConnection starts an MConnection on a drained pipe, with
+// FlushLowLatency = knobLowLatency unless mutate changes it.
+func newFlushKnobTestMConnection(t *testing.T, mutate func(*MConnConfig)) (*MConnection, *recordingConn) {
+	t.Helper()
+	server, client := net.Pipe()
+	t.Cleanup(func() { server.Close(); client.Close() })
+	go func() { _, _ = io.Copy(io.Discard, server) }()
+	conn := &recordingConn{Conn: client}
+	c := newUnstartedFlushTestMConnection(conn, knobLowLatency)
+	mutate(&c.config)
+	c.SetLogger(log.TestingLogger())
+	require.NoError(t, c.Start())
+	t.Cleanup(func() { _ = c.Stop() })
+	return c, conn
+}
+
+// requireWrites asserts the socket saw exactly n writes within knobWindow.
+func requireWrites(t *testing.T, conn *recordingConn, n int, msg string) []int {
+	t.Helper()
+	require.Eventually(t, func() bool { return len(conn.sizes()) >= n }, knobWindow, time.Millisecond, msg)
+	got := conn.sizes()
+	require.Len(t, got, n, msg)
+	return got
+}
+
+// requireNoNewWrites asserts the socket still has n writes after knobWindow.
+func requireNoNewWrites(t *testing.T, conn *recordingConn, n int, msg string) {
+	t.Helper()
+	time.Sleep(knobWindow)
+	require.Len(t, conn.sizes(), n, msg)
+}
+
+// awaitWrites waits for the low latency timer to produce the nth write.
+func awaitWrites(t *testing.T, conn *recordingConn, n int) []int {
+	t.Helper()
+	require.Eventually(t, func() bool { return len(conn.sizes()) >= n }, 4*knobLowLatency, time.Millisecond)
+	got := conn.sizes()
+	require.Len(t, got, n)
+	return got
+}
+
+func TestMConnectionFlushWholeFrames(t *testing.T) {
+	c, conn := newFlushKnobTestMConnection(t, func(cfg *MConnConfig) { cfg.FlushWholeFrames = true })
+	require.True(t, c.Send(0x01, make([]byte, 1500)))
+	got := requireWrites(t, conn, 1, "whole frames should go out before the timer")
+	require.Equal(t, dataMaxSize, got[0])
+	tail := awaitWrites(t, conn, 2)[1]
+	require.Positive(t, tail)
+	require.Less(t, tail, dataMaxSize, "only the tail waits for the timer")
+}
+
+func TestMConnectionFlushWholeFramesIgnoresBulk(t *testing.T) {
+	c, conn := newFlushKnobTestMConnection(t, func(cfg *MConnConfig) { cfg.FlushWholeFrames = true })
+	require.True(t, c.Send(0x02, make([]byte, 3000)))
+	requireNoNewWrites(t, conn, 0, "bulk traffic alone waits for the flush throttle")
+}
+
+func TestMConnectionFlushImmediateMinSize(t *testing.T) {
+	c, conn := newFlushKnobTestMConnection(t, func(cfg *MConnConfig) { cfg.FlushImmediateMinSize = 1024 })
+	require.True(t, c.Send(0x01, make([]byte, 1500)))
+	requireWrites(t, conn, 1, "a large message should be flushed right away")
+	require.True(t, c.Send(0x01, []byte("vote")))
+	requireNoNewWrites(t, conn, 1, "a small message should wait for the timer")
+	awaitWrites(t, conn, 2)
+}
+
+func TestMConnectionFlushQuietImmediate(t *testing.T) {
+	const quiet = 300 * time.Millisecond
+	c, conn := newFlushKnobTestMConnection(t, func(cfg *MConnConfig) { cfg.FlushQuietImmediate = quiet })
+	require.True(t, c.Send(0x01, []byte("vote1")))
+	requireWrites(t, conn, 1, "the first message after a quiet period should be flushed right away")
+	require.True(t, c.Send(0x01, []byte("vote2")))
+	requireNoNewWrites(t, conn, 1, "a message soon after a flush should wait for the timer")
+	awaitWrites(t, conn, 2)
+	time.Sleep(quiet + 50*time.Millisecond)
+	require.True(t, c.Send(0x01, []byte("vote3")))
+	requireWrites(t, conn, 3, "quiet again: flush right away")
+}
+
+func TestMConnectionFlushKnobsCompose(t *testing.T) {
+	c, conn := newFlushKnobTestMConnection(t, func(cfg *MConnConfig) {
+		cfg.FlushWholeFrames = true
+		cfg.FlushImmediateMinSize = 4096
+		cfg.FlushQuietImmediate = time.Hour
+	})
+	// quiet: flushed whole in one write, not split into frames and tail.
+	require.True(t, c.Send(0x01, make([]byte, 1500)))
+	first := requireWrites(t, conn, 1, "quiet flush")[0]
+	require.Greater(t, first, dataMaxSize)
+	// not quiet: whole frames now, the tail on the timer.
+	require.True(t, c.Send(0x01, make([]byte, 1500)))
+	require.Equal(t, dataMaxSize, requireWrites(t, conn, 2, "whole frames")[1])
+	require.Equal(t, first-dataMaxSize, awaitWrites(t, conn, 3)[2])
+	// still not quiet, but large enough to go out at once.
+	require.True(t, c.Send(0x01, make([]byte, 5000)))
+	require.Greater(t, requireWrites(t, conn, 4, "large message")[3], 5000)
+}
+
+func TestMConnectionFlushKnobsNeedFlushLowLatency(t *testing.T) {
+	c, conn := newFlushKnobTestMConnection(t, func(cfg *MConnConfig) {
+		cfg.FlushLowLatency = 0
+		cfg.FlushWholeFrames = true
+		cfg.FlushImmediateMinSize = 1
+		cfg.FlushQuietImmediate = time.Nanosecond
+	})
+	require.True(t, c.Send(0x01, make([]byte, 5000)))
+	requireNoNewWrites(t, conn, 0, "without flush_low_latency everything waits for the flush throttle")
 }

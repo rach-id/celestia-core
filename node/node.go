@@ -1181,6 +1181,7 @@ func makeNodeInfo(
 			TxIndex:    txIndexerStatus,
 			RPCAddress: config.RPC.ListenAddress,
 		},
+		SecretConnFrameVersion: p2p.DefaultSecretConnFrameVersion(),
 	}
 
 	if config.P2P.PexReactor {
