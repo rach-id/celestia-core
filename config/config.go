@@ -759,6 +759,14 @@ type P2PConfig struct {
 	// share frames. 0 waits for the flush throttle like other traffic.
 	FlushLowLatency time.Duration `mapstructure:"flush_low_latency"`
 
+	// Bench-only flush_low_latency refinements (#3763); off by default.
+	// Write whole 1 KiB frames early and hold only the tail.
+	FlushWholeFrames bool `mapstructure:"flush_whole_frames"`
+	// Flush completed latency-critical messages of at least this many bytes right away (0 = off).
+	FlushImmediateMinSize int `mapstructure:"flush_immediate_min_size"`
+	// Flush right away if no latency-critical flush happened in this long (0 = off).
+	FlushQuietImmediate time.Duration `mapstructure:"flush_quiet_immediate"`
+
 	// Maximum size of a message packet payload, in bytes
 	MaxPacketMsgPayloadSize int `mapstructure:"max_packet_msg_payload_size"`
 
@@ -850,6 +858,12 @@ func (cfg *P2PConfig) ValidateBasic() error {
 	}
 	if cfg.FlushLowLatency < 0 {
 		return errors.New("flush_low_latency can't be negative")
+	}
+	if cfg.FlushImmediateMinSize < 0 {
+		return errors.New("flush_immediate_min_size can't be negative")
+	}
+	if cfg.FlushQuietImmediate < 0 {
+		return errors.New("flush_quiet_immediate can't be negative")
 	}
 	if cfg.PersistentPeersMaxDialPeriod < 0 {
 		return errors.New("persistent_peers_max_dial_period can't be negative")

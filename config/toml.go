@@ -341,6 +341,14 @@ flush_throttle_timeout = "{{ .P2P.FlushThrottleTimeout }}"
 # share frames. "0s" waits for flush_throttle_timeout like other traffic.
 flush_low_latency = "{{ .P2P.FlushLowLatency }}"
 
+# Bench-only flush_low_latency refinements; all off by default.
+# Write whole 1 KiB frames as soon as they are buffered and hold only the tail.
+flush_whole_frames = {{ .P2P.FlushWholeFrames }}
+# Flush completed latency-critical messages of at least this many bytes right away (0 = off).
+flush_immediate_min_size = {{ .P2P.FlushImmediateMinSize }}
+# Flush right away if no latency-critical flush happened in this long ("0s" = off).
+flush_quiet_immediate = "{{ .P2P.FlushQuietImmediate }}"
+
 # Maximum size of a message packet payload, in bytes
 max_packet_msg_payload_size = {{ .P2P.MaxPacketMsgPayloadSize }}
 

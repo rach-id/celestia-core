@@ -83,7 +83,7 @@ type MConnection struct {
 
 	conn          net.Conn
 	bufConnReader *bufio.Reader
-	bufConnWriter *bufio.Writer
+	bufConnWriter *frameWriter
 	sendMonitor   *flow.Monitor
 	recvMonitor   *flow.Monitor
 	send          chan struct{}
@@ -112,6 +112,8 @@ type MConnection struct {
 	lowLatencyPending bool
 	// fires FlushLowLatency after the last LowLatency write; nil when the delay is 0.
 	lowLatencyTimer *timer.ThrottleTimer
+	// when a flush last carried a LowLatency message, for FlushQuietImmediate.
+	lastLowLatencyFlush time.Time
 
 	flushTimer *timer.ThrottleTimer // flush writes as necessary but throttled.
 	pingTimer  *time.Ticker         // send pings periodically
@@ -141,6 +143,18 @@ type MConnConfig struct {
 	// FlushLowLatency is how long LowLatency messages wait, once their queues
 	// drain, before a flush, so bursts share frames. 0 waits for the flush throttle.
 	FlushLowLatency time.Duration `mapstructure:"flush_low_latency"`
+
+	// FlushWholeFrames writes whole SecretConnection frames as soon as they are
+	// buffered while a LowLatency flush is pending; only the tail waits.
+	FlushWholeFrames bool `mapstructure:"flush_whole_frames"`
+
+	// FlushImmediateMinSize flushes a completed LowLatency message of at least
+	// this many bytes right away instead of waiting. 0 disables it.
+	FlushImmediateMinSize int `mapstructure:"flush_immediate_min_size"`
+
+	// FlushQuietImmediate flushes LowLatency messages right away, instead of
+	// arming the timer, if no LowLatency flush happened in this long. 0 disables it.
+	FlushQuietImmediate time.Duration `mapstructure:"flush_quiet_immediate"`
 
 	// Interval to send pings
 	PingInterval time.Duration `mapstructure:"ping_interval"`
@@ -196,7 +210,7 @@ func NewMConnectionWithConfig(
 	mconn := &MConnection{
 		conn:          conn,
 		bufConnReader: bufio.NewReaderSize(conn, minReadBufferSize),
-		bufConnWriter: bufio.NewWriterSize(conn, minWriteBufferSize),
+		bufConnWriter: newFrameWriter(conn, minWriteBufferSize),
 		sendMonitor:   flow.New(0, 0),
 		recvMonitor:   flow.New(0, 0),
 		send:          make(chan struct{}, 1),
@@ -345,6 +359,9 @@ func (c *MConnection) String() string {
 
 func (c *MConnection) flush() {
 	//c.Logger.Debug("Flush", "conn", c)
+	if c.lowLatencyPending && c.config.FlushQuietImmediate > 0 {
+		c.lastLowLatencyFlush = time.Now()
+	}
 	c.lowLatencyPending = false
 	if c.lowLatencyTimer != nil {
 		// later writes get their own full window rather than this deadline.
@@ -577,12 +594,26 @@ func (c *MConnection) flushLowLatency() {
 	if !c.lowLatencyPending {
 		return
 	}
+	drained := true
 	for _, ch := range c.channels {
 		if ch.desc.LowLatency && ch.isSendPending() {
-			return
+			drained = false
+			break
 		}
 	}
-	c.lowLatencyTimer.Set()
+	if q := c.config.FlushQuietImmediate; drained && q > 0 && time.Since(c.lastLowLatencyFlush) >= q {
+		c.flush()
+		return
+	}
+	if c.config.FlushWholeFrames && c.bufConnWriter.Buffered() >= dataMaxSize {
+		// the tail stays pending until the timer fires.
+		if err := c.bufConnWriter.FlushWhole(dataMaxSize); err != nil {
+			c.Logger.Debug("MConnection flush failed", "err", err)
+		}
+	}
+	if drained {
+		c.lowLatencyTimer.Set()
+	}
 }
 
 // selects a channel to gossip our next message on.
@@ -624,6 +655,10 @@ func (c *MConnection) sendPacketMsgOnChannel(w protoio.Writer, sendChannel *Chan
 	// sending is cleared once the last packet of a message is written.
 	if c.lowLatencyTimer != nil && sendChannel.desc.LowLatency && len(sendChannel.sending) == 0 {
 		c.lowLatencyPending = true
+		if m := c.config.FlushImmediateMinSize; m > 0 && sendChannel.sendingSize >= m {
+			c.flush()
+			return n, false
+		}
 	}
 	c.flushTimer.Set()
 	return n, false
@@ -837,6 +872,7 @@ type Channel struct {
 	sendQueueSize int32 // atomic.
 	recving       []byte
 	sending       []byte
+	sendingSize   int   // full length of the message in sending
 	recentlySent  int64 // exponential moving average
 
 	maxPacketMsgPayloadSize int
@@ -908,6 +944,7 @@ func (ch *Channel) isSendPending() bool {
 			return false
 		}
 		ch.sending = <-ch.sendQueue
+		ch.sendingSize = len(ch.sending)
 	}
 	return true
 }
