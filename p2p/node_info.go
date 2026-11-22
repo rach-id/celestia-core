@@ -94,6 +94,10 @@ type DefaultNodeInfo struct {
 	// ASCIIText fields
 	Moniker string               `json:"moniker"` // arbitrary moniker
 	Other   DefaultNodeInfoOther `json:"other"`   // other application specific data
+
+	// Highest SecretConnection frame format spoken after the NodeInfo
+	// exchange; 0 = fixed frames. Old nodes ignore the field.
+	SecretConnFrameVersion uint32 `json:"secret_conn_frame_version,omitempty"`
 }
 
 // DefaultNodeInfoOther is the misc. applcation specific data
@@ -326,6 +330,7 @@ func (info DefaultNodeInfo) ToProto() *tmp2p.DefaultNodeInfo {
 		TxIndex:    info.Other.TxIndex,
 		RPCAddress: info.Other.RPCAddress,
 	}
+	dni.SecretConnFrameVersion = info.SecretConnFrameVersion
 
 	return dni
 }
@@ -350,6 +355,7 @@ func DefaultNodeInfoFromToProto(pb *tmp2p.DefaultNodeInfo) (DefaultNodeInfo, err
 			TxIndex:    pb.Other.TxIndex,
 			RPCAddress: pb.Other.RPCAddress,
 		},
+		SecretConnFrameVersion: pb.SecretConnFrameVersion,
 	}
 
 	return dni, nil

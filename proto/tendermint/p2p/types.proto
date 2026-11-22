@@ -26,6 +26,9 @@ message DefaultNodeInfo {
   bytes                channels         = 6;
   string               moniker          = 7;
   DefaultNodeInfoOther other            = 8 [(gogoproto.nullable) = false];
+  // Highest SecretConnection frame format this node speaks after the NodeInfo
+  // exchange: 0 (absent) = fixed 1,044 B frames, 1 = variable-length frames.
+  uint32 secret_conn_frame_version = 9;
 }
 
 message DefaultNodeInfoOther {

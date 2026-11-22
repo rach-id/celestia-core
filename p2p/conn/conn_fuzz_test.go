@@ -355,74 +355,8 @@ func FuzzSecretConnectionRead(f *testing.F) {
 		for _, w := range stream {
 			streamLen += len(w)
 		}
-		maxEmptyReads := streamLen / sealedFrameSize
-
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			defer attackerConn.PipeWriter.Close()
-			for _, w := range stream {
-				if _, err := attackerConn.Write(w); err != nil {
-					return
-				}
-			}
-		}()
-
-		// The endpoints are io.Pipes, which have no read deadline (and
-		// SecretConnection.SetReadDeadline requires a net.Conn), so a
-		// watchdog closes them to unblock a stuck Read. Cleanup closes them
-		// even if the loop below fails, which also unblocks the writer.
-		victimConn := victim.conn.(kvstoreConn)
-		var timedOut atomic.Bool
-		watchdog := time.AfterFunc(fuzzWatchdog, func() {
-			timedOut.Store(true)
-			_ = victimConn.Close()
-			_ = attackerConn.Close()
-		})
-		t.Cleanup(func() {
-			watchdog.Stop()
-			_ = victimConn.Close()
-			_ = attackerConn.Close()
-			<-done
-		})
-
-		var (
-			got        []byte
-			readErr    error
-			emptyReads int
-		)
-		for i := 0; ; i++ {
-			size := dataMaxSize
-			if len(readSizes) > 0 {
-				size = 1 + int(readSizes[i%len(readSizes)])*8
-			}
-			buf := make([]byte, size)
-			n, err := victim.Read(buf)
-			if n < 0 || n > len(buf) {
-				t.Fatalf("Read returned n=%d for a %d byte buffer", n, len(buf))
-			}
-			got = append(got, buf[:n]...)
-			if err != nil {
-				readErr = err
-				break
-			}
-			if n == 0 {
-				if emptyReads++; emptyReads > maxEmptyReads {
-					t.Fatalf("Read returned (0, nil) %d times for %d sealed frames", emptyReads, maxEmptyReads)
-				}
-			}
-			if len(got) > len(expected) {
-				t.Fatalf("read %d bytes, model expects at most %d", len(got), len(expected))
-			}
-		}
-		watchdog.Stop()
-		_ = victim.Close()
-		<-done
-		_ = attacker.Close()
-
-		if timedOut.Load() {
-			t.Fatalf("Read loop did not finish within %v (read %d of %d bytes)", fuzzWatchdog, len(got), len(expected))
-		}
+		got, readErr := fuzzReadStream(t, attacker, victim, stream, readSizes,
+			streamLen/sealedFrameSize, len(expected))
 		if !bytes.Equal(got, expected) {
 			t.Fatalf("read %d bytes, expected %d (err=%v)", len(got), len(expected), readErr)
 		}
@@ -441,6 +375,222 @@ func FuzzSecretConnectionRead(f *testing.F) {
 			}
 		}
 	})
+}
+
+// fuzzReadStream writes stream to victim through attacker's raw conn and
+// reads victim until it fails, checking each Read against the bounds.
+func fuzzReadStream(
+	t *testing.T, attacker, victim *SecretConnection, stream [][]byte,
+	readSizes []byte, maxEmptyReads, maxLen int,
+) ([]byte, error) {
+	t.Helper()
+	attackerConn := attacker.conn.(kvstoreConn)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer attackerConn.PipeWriter.Close()
+		for _, w := range stream {
+			if _, err := attackerConn.Write(w); err != nil {
+				return
+			}
+		}
+	}()
+
+	// The endpoints are io.Pipes, which have no read deadline (and
+	// SecretConnection.SetReadDeadline requires a net.Conn), so a
+	// watchdog closes them to unblock a stuck Read. Cleanup closes them
+	// even if the loop below fails, which also unblocks the writer.
+	victimConn := victim.conn.(kvstoreConn)
+	var timedOut atomic.Bool
+	watchdog := time.AfterFunc(fuzzWatchdog, func() {
+		timedOut.Store(true)
+		_ = victimConn.Close()
+		_ = attackerConn.Close()
+	})
+	t.Cleanup(func() {
+		watchdog.Stop()
+		_ = victimConn.Close()
+		_ = attackerConn.Close()
+		<-done
+	})
+
+	var (
+		got        []byte
+		readErr    error
+		emptyReads int
+	)
+	for i := 0; ; i++ {
+		size := dataMaxSize
+		if len(readSizes) > 0 {
+			size = 1 + int(readSizes[i%len(readSizes)])*8
+		}
+		buf := make([]byte, size)
+		n, err := victim.Read(buf)
+		if n < 0 || n > len(buf) {
+			t.Fatalf("Read returned n=%d for a %d byte buffer", n, len(buf))
+		}
+		got = append(got, buf[:n]...)
+		if err != nil {
+			readErr = err
+			break
+		}
+		if n == 0 {
+			if emptyReads++; emptyReads > maxEmptyReads {
+				t.Fatalf("Read returned (0, nil) %d times for %d sealed frames", emptyReads, maxEmptyReads)
+			}
+		}
+		if len(got) > maxLen {
+			t.Fatalf("read %d bytes, model expects at most %d", len(got), maxLen)
+		}
+	}
+	watchdog.Stop()
+	_ = victim.Close()
+	<-done
+	_ = attacker.Close()
+
+	if timedOut.Load() {
+		t.Fatalf("Read loop did not finish within %v (read %d of %d bytes)", fuzzWatchdog, len(got), maxLen)
+	}
+	return got, readErr
+}
+
+// FuzzSecretConnectionReadV1 is FuzzSecretConnectionRead for variable
+// frames: the fuzzer controls the length header (also out of range or not
+// matching the authenticated length), raw bytes, fixed frames sent to a
+// variable reader, and regular Writes.
+func FuzzSecretConnectionReadV1(f *testing.F) {
+	f.Add([]byte{0, 0, 5, 'h', 'e', 'l', 'l', 'o'}, []byte{3})
+	f.Add([]byte{1, 0, 0, 0, 3, 'a', 'b', 'c'}, []byte{})         // length 0 on the wire
+	f.Add([]byte{1, 4, 1, 0, 3, 'a', 'b', 'c'}, []byte{})         // length max+1 on the wire
+	f.Add([]byte{1, 0, 2, 0, 3, 'a', 'b', 'c'}, []byte{1})        // header != authenticated length
+	f.Add([]byte{0, 0, 3, 'a', 'b', 'c', 2, 10, 0xde}, []byte{1}) // ciphertext garbage
+	f.Add([]byte{3, 0x08, 0x00, 7}, []byte{255, 0, 17})           // multi-frame Write
+	f.Add([]byte{4, 0, 3, 'x', 'y', 'z'}, []byte{})               // fixed frame to a v1 reader
+	f.Add([]byte{0, 4, 0, 0xaa}, []byte{200})                     // exactly dataMaxSize
+
+	f.Fuzz(func(t *testing.T, ops, readSizes []byte) {
+		if len(ops) > fuzzMaxInput {
+			return
+		}
+		attacker, victim := makeSecretConnPair(t)
+		if err := attacker.EnableVariableFrames(); err != nil {
+			t.Fatal(err)
+		}
+		if err := victim.EnableVariableFrames(); err != nil {
+			t.Fatal(err)
+		}
+
+		var (
+			stream   [][]byte
+			expected []byte
+			broken   bool
+			wantLen  bool // an out-of-range wire length comes first
+			take     = func(n int) []byte {
+				if n > len(ops) {
+					n = len(ops)
+				}
+				b := ops[:n]
+				ops = ops[n:]
+				return b
+			}
+			u16 = func() int {
+				return int(binary.BigEndian.Uint16(append(append([]byte{}, take(2)...), 0, 0)))
+			}
+		)
+		for frames := 0; len(ops) > 0 && frames < fuzzMaxFrames; frames++ {
+			op := ops[0]
+			ops = ops[1:]
+			switch op % 5 {
+			case 0, 1: // one sealed frame; case 1 also picks the wire header
+				wireLen := -1
+				if op%5 == 1 {
+					wireLen = u16()
+				}
+				payload := append([]byte{}, take(1+u16()%dataMaxSize)...)
+				if len(payload) == 0 {
+					payload = []byte{op}
+				}
+				if wireLen < 0 {
+					wireLen = len(payload)
+				}
+				var hdr, aad [varFrameLenSize]byte
+				binary.BigEndian.PutUint16(hdr[:], uint16(wireLen))
+				binary.BigEndian.PutUint16(aad[:], uint16(len(payload)))
+				frame := attacker.sendAead.Seal(hdr[:], attacker.sendNonce[:], payload, aad[:])
+				incrNonce(attacker.sendNonce)
+				stream = append(stream, frame)
+				switch {
+				case broken:
+				case wireLen == len(payload):
+					expected = append(expected, payload...)
+				case wireLen == 0 || wireLen > dataMaxSize:
+					broken, wantLen = true, true
+				default:
+					broken = true
+				}
+			case 2: // unauthenticated bytes
+				n := 1
+				if b := take(1); len(b) == 1 {
+					n += int(b[0]) * 8
+				}
+				garbage := append([]byte{}, take(n)...)
+				for len(garbage) < n {
+					garbage = append(garbage, op)
+				}
+				stream = append(stream, garbage)
+				broken = true
+			case 3: // regular Write, possibly spanning several frames
+				data := make([]byte, u16()%(3*dataMaxSize))
+				for i := range data {
+					data[i] = byte(i) ^ op
+				}
+				stream = append(stream, captureWriteFuzz(t, attacker, data)...)
+				if !broken {
+					expected = append(expected, data...)
+				}
+			case 4: // a fixed frame sent to the variable reader
+				attacker.sendVariable = false
+				data := append([]byte{op}, take(u16()%dataMaxSize)...)
+				stream = append(stream, captureWriteFuzz(t, attacker, data)...)
+				attacker.sendVariable = true
+				broken = true
+			}
+		}
+
+		// Variable frames are never empty, so Read never returns (0, nil).
+		got, readErr := fuzzReadStream(t, attacker, victim, stream, readSizes, 0, len(expected))
+		if !bytes.Equal(got, expected) {
+			t.Fatalf("read %d bytes, expected %d (err=%v)", len(got), len(expected), readErr)
+		}
+		switch {
+		case wantLen:
+			if !errors.Is(readErr, ErrInvalidFrameLength) {
+				t.Fatalf("expected ErrInvalidFrameLength, got %v", readErr)
+			}
+		case broken:
+			if readErr == nil || errors.Is(readErr, io.EOF) {
+				t.Fatalf("expected failure on a broken stream, got %v", readErr)
+			}
+		default:
+			if !errors.Is(readErr, io.EOF) {
+				t.Fatalf("expected clean EOF, got %v", readErr)
+			}
+		}
+	})
+}
+
+// captureWriteFuzz returns the wire bytes of sc.Write(data), if any.
+func captureWriteFuzz(t *testing.T, sc *SecretConnection, data []byte) [][]byte {
+	var buf bytes.Buffer
+	sc.connWriter.Reset(&buf)
+	defer sc.connWriter.Reset(sc.conn)
+	if _, err := sc.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() == 0 {
+		return nil
+	}
+	return [][]byte{buf.Bytes()}
 }
 
 // halfPipe is a net.Conn made of two io.Pipes so each side can close its
