@@ -45,10 +45,19 @@ const (
 	labelSecretConnectionMac     = "SECRET_CONNECTION_MAC"
 
 	defaultWriteBufferSize = 128 * 1024
+
+	// Variable frame: uint16 BE length L (1..dataMaxSize) || Seal(payload, aad=length).
+	varFrameLenSize = 2
+
+	// FrameVersionFixed and FrameVersionVariable are the values advertised in
+	// NodeInfo.SecretConnFrameVersion.
+	FrameVersionFixed    = 0
+	FrameVersionVariable = 1
 )
 
 var (
 	ErrSmallOrderRemotePubKey = errors.New("detected low order point from remote peer")
+	ErrInvalidFrameLength     = errors.New("invalid SecretConnection frame length")
 
 	secretConnKeyAndChallengeGen = []byte("TENDERMINT_SECRET_CONNECTION_KEY_AND_CHALLENGE_GEN")
 )
@@ -85,11 +94,13 @@ type SecretConnection struct {
 	recvNonce       *[aeadNonceSize]byte
 	recvFrame       []byte
 	recvSealedFrame []byte
+	recvVariable    bool
 
 	sendMtx         cmtsync.Mutex
 	sendNonce       *[aeadNonceSize]byte
 	sendFrame       []byte
 	sendSealedFrame []byte
+	sendVariable    bool
 }
 
 // MakeSecretConnection performs handshake and returns a new authenticated
@@ -201,11 +212,38 @@ func (sc *SecretConnection) RemotePubKey() crypto.PubKey {
 	return sc.remPubKey
 }
 
-// Writes encrypted frames of `totalFrameSize + aeadSizeOverhead`.
+// EnableVariableFrames switches both directions to variable-length frames,
+// keeping the keys and nonce counters. Both peers must call it at the same
+// frame boundary with no I/O in flight; it fails if a received frame is
+// partially consumed.
+func (sc *SecretConnection) EnableVariableFrames() error {
+	sc.sendMtx.Lock()
+	defer sc.sendMtx.Unlock()
+	sc.recvMtx.Lock()
+	defer sc.recvMtx.Unlock()
+	if len(sc.recvBuffer) > 0 {
+		return errors.New("cannot switch SecretConnection frame format mid-frame")
+	}
+	sc.sendVariable, sc.recvVariable = true, true
+	return nil
+}
+
+// VariableFrames reports whether variable-length frames are enabled.
+func (sc *SecretConnection) VariableFrames() bool {
+	sc.sendMtx.Lock()
+	defer sc.sendMtx.Unlock()
+	return sc.sendVariable
+}
+
+// Writes encrypted frames of `totalFrameSize + aeadSizeOverhead`, or of
+// `varFrameLenSize + len(chunk) + aeadSizeOverhead` with variable frames.
 // CONTRACT: data smaller than dataMaxSize is written atomically.
 func (sc *SecretConnection) Write(data []byte) (n int, err error) {
 	sc.sendMtx.Lock()
 	defer sc.sendMtx.Unlock()
+	if sc.sendVariable {
+		return sc.writeVariable(data)
+	}
 	sealedFrame, frame := sc.sendSealedFrame, sc.sendFrame
 
 	for 0 < len(data) {
@@ -244,6 +282,32 @@ func (sc *SecretConnection) Write(data []byte) (n int, err error) {
 	return n, nil
 }
 
+// writeVariable seals each chunk of up to dataMaxSize bytes as one variable
+// frame. Caller holds sendMtx.
+func (sc *SecretConnection) writeVariable(data []byte) (n int, err error) {
+	var hdr [varFrameLenSize]byte
+	for len(data) > 0 {
+		chunk := data
+		if len(chunk) > dataMaxSize {
+			chunk = chunk[:dataMaxSize]
+		}
+		data = data[len(chunk):]
+		binary.BigEndian.PutUint16(hdr[:], uint16(len(chunk)))
+		copy(sc.sendSealedFrame, hdr[:])
+		frame := sc.sendAead.Seal(sc.sendSealedFrame[:varFrameLenSize], sc.sendNonce[:], chunk, hdr[:])
+		incrNonce(sc.sendNonce)
+		if _, err := sc.connWriter.Write(frame); err != nil {
+			return n, err
+		}
+		n += len(chunk)
+	}
+	// Nothing counts as written until the buffered frames reach the conn.
+	if err := sc.connWriter.Flush(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
 // CONTRACT: data smaller than dataMaxSize is read atomically.
 func (sc *SecretConnection) Read(data []byte) (n int, err error) {
 	sc.recvMtx.Lock()
@@ -254,6 +318,9 @@ func (sc *SecretConnection) Read(data []byte) (n int, err error) {
 		n = copy(data, sc.recvBuffer)
 		sc.recvBuffer = sc.recvBuffer[n:]
 		return n, err
+	}
+	if sc.recvVariable {
+		return sc.readVariable(data)
 	}
 
 	// read off the conn
@@ -286,6 +353,38 @@ func (sc *SecretConnection) Read(data []byte) (n int, err error) {
 		copy(sc.recvBuffer, chunk[n:])
 	}
 	return n, err
+}
+
+// readVariable reads and opens one variable frame. The length is bounded
+// before anything else is read. Caller holds recvMtx; recvBuffer is empty.
+func (sc *SecretConnection) readVariable(data []byte) (int, error) {
+	var hdr [varFrameLenSize]byte
+	if _, err := io.ReadFull(sc.conn, hdr[:]); err != nil {
+		return 0, err
+	}
+	chunkLength := int(binary.BigEndian.Uint16(hdr[:]))
+	if chunkLength == 0 || chunkLength > dataMaxSize {
+		return 0, ErrInvalidFrameLength
+	}
+	sealed := sc.recvSealedFrame[:chunkLength+aeadSizeOverhead]
+	if _, err := io.ReadFull(sc.conn, sealed); err != nil {
+		if errors.Is(err, io.EOF) {
+			err = io.ErrUnexpectedEOF // the header was already consumed
+		}
+		return 0, err
+	}
+	chunk, err := sc.recvAead.Open(sc.recvFrame[:0], sc.recvNonce[:], sealed, hdr[:])
+	if err != nil {
+		return 0, fmt.Errorf("failed to decrypt SecretConnection: %w", err)
+	}
+	incrNonce(sc.recvNonce)
+
+	n := copy(data, chunk)
+	if n < len(chunk) {
+		sc.recvBuffer = make([]byte, len(chunk)-n)
+		copy(sc.recvBuffer, chunk[n:])
+	}
+	return n, nil
 }
 
 // Implements net.Conn
